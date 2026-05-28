@@ -1,0 +1,20 @@
+broker:
+  id: 1
+  host: 0.0.0.0
+  port: 9092
+
+storage:
+  data_dir: ./data
+  segment_bytes: 1073741824
+  flush_policy: async
+  flush_interval_ms: 1000
+
+network:
+  io_threads: 4
+  worker_threads: 8
+  max_connections: 10000
+  read_buffer_bytes: 65536
+
+consumer:
+  session_timeout_ms: 10000
+  rebalance_timeout_ms: 30000
