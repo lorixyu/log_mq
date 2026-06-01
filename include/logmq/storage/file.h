@@ -81,6 +81,8 @@ public:
 
     Status Fsync() const;
 
+    Status Truncate(std::uint64_t size) const;
+
     Status Close();
 
     // Returns the size of the file.

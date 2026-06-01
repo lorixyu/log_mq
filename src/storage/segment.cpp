@@ -94,6 +94,19 @@ Result<RecordBatch> Segment::Read(std::uint64_t position, std::size_t max_bytes)
 
 Status Segment::Flush() const { return file_.Fsync(); }
 
+Status Segment::Truncate(std::uint64_t size) {
+    if (closed_) {
+        return Status::InvalidArgument("truncate on closed segment");
+    }
+
+    Status status = file_.Truncate(size);
+    if (!status.ok()) {
+        return status;
+    }
+    write_position_ = size;
+    return Status::Ok();
+}
+
 Status Segment::Close() {
     closed_ = true;
     return file_.Close();

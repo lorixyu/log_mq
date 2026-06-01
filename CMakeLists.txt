@@ -17,7 +17,9 @@ add_library(logmq_core
     src/base/config.cpp
     src/base/status.cpp
     src/storage/crc32.cpp
+    src/storage/commit_log.cpp
     src/storage/file.cpp
+    src/storage/offset_index.cpp
     src/storage/record.cpp
     src/storage/record_batch.cpp
     src/storage/segment.cpp

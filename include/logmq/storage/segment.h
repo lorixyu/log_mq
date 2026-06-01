@@ -32,6 +32,8 @@ public:
 
     Status Flush() const;
 
+    Status Truncate(std::uint64_t size);
+
     Status Close();
 
     [[nodiscard]] Offset base_offset() const;

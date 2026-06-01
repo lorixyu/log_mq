@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <cstring>
+#include <limits>
 #include <utility>
 
 namespace logmq {
@@ -105,6 +106,26 @@ Status File::Fsync() const {
         }
         if (errno != EINTR) {
             return IoErrorFromErrno("fsync", path_);
+        }
+    }
+}
+
+Status File::Truncate(std::uint64_t size) const {
+    if (!is_open()) {
+        return Status::InvalidArgument("truncate on closed file");
+    }
+
+    if (size > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max())) {
+        return Status::InvalidArgument("truncate size is too large");
+    }
+
+    while (true) {
+        errno = 0;
+        if (::ftruncate(fd_, static_cast<off_t>(size)) == 0) {
+            return Status::Ok();
+        }
+        if (errno != EINTR) {
+            return IoErrorFromErrno("ftruncate", path_);
         }
     }
 }
