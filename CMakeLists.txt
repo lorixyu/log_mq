@@ -14,14 +14,19 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 add_library(logmq_core
-  src/base/config.cpp
-  src/base/status.cpp
+    src/base/config.cpp
+    src/base/status.cpp
+    src/storage/crc32.cpp
+    src/storage/file.cpp
+    src/storage/record.cpp
+    src/storage/record_batch.cpp
+    src/storage/segment.cpp
 )
 
 add_library(logmq::core ALIAS logmq_core)
 
 target_include_directories(logmq_core
-  PUBLIC
+    PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
@@ -29,12 +34,12 @@ target_include_directories(logmq_core
 target_compile_features(logmq_core PUBLIC cxx_std_20)
 
 if(MSVC)
-  target_compile_options(logmq_core PRIVATE /W4 /permissive-)
+    target_compile_options(logmq_core PRIVATE /W4 /permissive-)
 else()
-  target_compile_options(logmq_core PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(logmq_core PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 if(LOGMQ_BUILD_TESTS)
-  enable_testing()
-  add_subdirectory(tests)
+    enable_testing()
+    add_subdirectory(tests)
 endif()
