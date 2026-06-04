@@ -16,6 +16,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_library(logmq_core
     src/base/config.cpp
     src/base/status.cpp
+    src/protocol/codec.cpp
     src/storage/crc32.cpp
     src/storage/commit_log.cpp
     src/storage/file.cpp

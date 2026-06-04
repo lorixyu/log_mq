@@ -28,9 +28,20 @@ if(GTest_FOUND)
         GTest::gtest_main
     )
 
+    add_executable(logmq_protocol_test
+        unit/protocol_test.cpp
+    )
+
+    target_link_libraries(logmq_protocol_test
+        PRIVATE
+        logmq::core
+        GTest::gtest_main
+    )
+
     include(GoogleTest)
     gtest_discover_tests(logmq_base_test)
     gtest_discover_tests(logmq_storage_test)
+    gtest_discover_tests(logmq_protocol_test)
 elseif(TARGET PkgConfig::GTEST)
     add_executable(logmq_base_test
         unit/base_test.cpp
@@ -52,9 +63,20 @@ elseif(TARGET PkgConfig::GTEST)
         PkgConfig::GTEST
     )
 
+    add_executable(logmq_protocol_test
+        unit/protocol_test.cpp
+    )
+
+    target_link_libraries(logmq_protocol_test
+        PRIVATE
+        logmq::core
+        PkgConfig::GTEST
+    )
+
     include(GoogleTest)
     gtest_discover_tests(logmq_base_test)
     gtest_discover_tests(logmq_storage_test)
+    gtest_discover_tests(logmq_protocol_test)
 else()
     message(WARNING "GoogleTest not found; building smoke test only.")
 
