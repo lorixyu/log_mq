@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <string>
+#include <thread>
 
 #include "logmq/base/result.h"
 #include "logmq/base/types.h"
@@ -34,7 +35,7 @@ struct StorageConfig {
 // 网络程和连接数限制配置。
 struct NetworkConfig {
     int io_threads{4};
-    int worker_threads{8};
+    int worker_threads{std::thread::hardware_concurrency()};
     std::size_t max_connections{10000};
     std::size_t read_buffer_bytes{64 * 1024};
 };
