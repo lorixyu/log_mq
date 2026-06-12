@@ -32,13 +32,19 @@ struct StorageConfig {
     std::chrono::milliseconds flush_interval{1000};
 };
 
+inline int DefaultWorkerThreads() {
+    const unsigned int n = std::thread::hardware_concurrency();
+    return n == 0 ? 4 : static_cast<int>(n);
+}
+
 // 网络程和连接数限制配置。
 struct NetworkConfig {
     int io_threads{4};
-    int worker_threads{std::thread::hardware_concurrency()};
+    int worker_threads{DefaultWorkerThreads()};
     std::size_t max_connections{10000};
     std::size_t read_buffer_bytes{64 * 1024};
 };
+
 
 // Consumer Group 相关超时配置
 struct ConsumerConfig {

@@ -89,13 +89,48 @@ struct ErrorResponse {
     std::string message;
 };
 
-// Decoded response frame. body is reserved for future success payloads.
+// Produce returns the logical offset range assigned to the appended batch.
+// Clients can derive [base_offset, base_offset + record_count).
+struct ProduceResponse {
+    Offset base_offset{kInvalidOffset};
+    std::uint32_t record_count{0};
+};
+
+// Fetch returns the batch found at or after the requested offset. The
+// high_watermark is the visible end offset for this partition in the current broker.
+struct FetchResponse {
+    Offset base_offset{kInvalidOffset};
+    Offset high_watermark{kInvalidOffset};
+    std::vector<ProtocolRecord> records;
+};
+
+struct TopicMetadata {
+    TopicName topic;
+    std::uint32_t partition_count{0};
+};
+
+struct MetadataResponse {
+    std::vector<TopicMetadata> topics;
+};
+
+struct CreateTopicResponse {
+    TopicName topic;
+    std::uint32_t partition_count{0};
+};
+
+// Successful response payloads are typed by api_key, just like RequestBody.
+// Error responses keep the right empty alternative so callers can still inspect api_key.
+using ResponseBody =
+    std::variant<ProduceResponse, FetchResponse, MetadataResponse, CreateTopicResponse>;
+
+// Wire body layout is: error_code + message + optional success payload.
+// The success payload is present only when error_code == kNone.
 struct ResponseEnvelope {
     ApiKey api_key{ApiKey::kProduce};
     std::uint16_t version{kProtocolVersion};
     std::uint64_t request_id{0};
     ErrorResponse error;
-    std::vector<std::byte> body;
+    ResponseBody body{};
 };
 
 }  // namespace logmq

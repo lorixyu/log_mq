@@ -16,6 +16,15 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_library(logmq_core
     src/base/config.cpp
     src/base/status.cpp
+    src/broker/broker_service.cpp
+    src/broker/topic_manager.cpp
+    src/net/buffer.cpp
+    src/net/channel.cpp
+    src/net/event_loop.cpp
+    src/net/event_loop_thread_pool.cpp
+    src/net/tcp_connection.cpp
+    src/net/tcp_server.cpp
+    src/net/worker_pool.cpp
     src/protocol/codec.cpp
     src/storage/crc32.cpp
     src/storage/commit_log.cpp
@@ -28,6 +37,20 @@ add_library(logmq_core
 
 add_library(logmq::core ALIAS logmq_core)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_sources(logmq_core
+        PRIVATE
+        src/net/poll/poller.cpp
+        src/net/poll/epoll_poller.cpp
+    )
+elseif(CMAKE_SYSTEM_NAME MATCHES "Darwin|FreeBSD|OpenBSD|NetBSD")
+    target_sources(logmq_core
+        PRIVATE
+        src/net/poll/poller.cpp
+        src/net/poll/kqueue_poller.cpp
+    )
+endif()
+
 target_include_directories(logmq_core
     PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
@@ -35,6 +58,24 @@ target_include_directories(logmq_core
 )
 
 target_compile_features(logmq_core PUBLIC cxx_std_20)
+
+add_executable(logmq_broker
+    src/broker/main.cpp
+)
+
+target_link_libraries(logmq_broker
+    PRIVATE
+    logmq::core
+)
+
+add_executable(logmq_cli
+    tools/logmq_cli.cpp
+)
+
+target_link_libraries(logmq_cli
+    PRIVATE
+    logmq::core
+)
 
 if(MSVC)
     target_compile_options(logmq_core PRIVATE /W4 /permissive-)

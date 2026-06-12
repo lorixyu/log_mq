@@ -19,6 +19,8 @@ namespace logmq {
 
 [[nodiscard]] Result<RequestEnvelope> DecodeRequest(std::span<const std::byte> frame);
 
+[[nodiscard]] Result<std::vector<std::byte>> EncodeResponse(const ResponseEnvelope& response);
+
 [[nodiscard]] Result<std::vector<std::byte>> EncodeErrorResponse(
     ApiKey api_key, std::uint16_t version, std::uint64_t request_id, ProtocolErrorCode code,
     std::string_view message);

@@ -217,6 +217,36 @@ Result<std::vector<std::byte>> EncodeCreateTopicBody(const CreateTopicRequest& r
     return body;
 }
 
+Status AppendProtocolRecord(const ProtocolRecord& record, std::vector<std::byte>& body) {
+    AppendBigEndian<std::uint64_t>(record.timestamp, body);
+    Status status = AppendString(record.key, body);
+    if (!status.ok()) {
+        return status;
+    }
+    return AppendString(record.value, body);
+}
+
+Result<ProtocolRecord> DecodeProtocolRecord(BodyReader& reader) {
+    auto timestamp = reader.ReadUInt<std::uint64_t>();
+    if (!timestamp.ok()) {
+        return timestamp.status();
+    }
+    auto key = reader.ReadString();
+    if (!key.ok()) {
+        return key.status();
+    }
+    auto value = reader.ReadString();
+    if (!value.ok()) {
+        return value.status();
+    }
+
+    ProtocolRecord record;
+    record.timestamp = timestamp.value();
+    record.key = std::move(key).value();
+    record.value = std::move(value).value();
+    return record;
+}
+
 // Parse xxBody(Produce, Fetch..)
 Result<ProduceRequest> DecodeProduceBody(std::span<const std::byte> body) {
     BodyReader reader(body);
@@ -242,24 +272,11 @@ Result<ProduceRequest> DecodeProduceBody(std::span<const std::byte> body) {
     request.records.reserve(record_count.value());
 
     for (std::uint32_t i = 0; i < record_count.value(); ++i) {
-        auto timestamp = reader.ReadUInt<std::uint64_t>();
-        if (!timestamp.ok()) {
-            return timestamp.status();
+        auto record = DecodeProtocolRecord(reader);
+        if (!record.ok()) {
+            return record.status();
         }
-        auto key = reader.ReadString();
-        if (!key.ok()) {
-            return key.status();
-        }
-        auto value = reader.ReadString();
-        if (!value.ok()) {
-            return value.status();
-        }
-
-        ProtocolRecord record;
-        record.timestamp = timestamp.value();
-        record.key = std::move(key).value();
-        record.value = std::move(value).value();
-        request.records.push_back(std::move(record));
+        request.records.push_back(std::move(record).value());
     }
 
     if (!reader.consumed()) {
@@ -355,6 +372,229 @@ Result<std::vector<std::byte>> EncodeRequestBody(const RequestEnvelope& request)
                 return Status::InvalidArgument("create topic request envelope has wrong body type");
             }
             return EncodeCreateTopicBody(std::get<CreateTopicRequest>(request.body));
+    }
+    return Status::InvalidArgument("unknown api key");
+}
+
+Result<std::vector<std::byte>> EncodeProduceResponseBody(const ProduceResponse& response) {
+    if (response.base_offset < 0) {
+        return Status::InvalidArgument("produce response base_offset must not be negative");
+    }
+
+    std::vector<std::byte> body;
+    AppendBigEndian<std::uint64_t>(static_cast<std::uint64_t>(response.base_offset), body);
+    AppendBigEndian<std::uint32_t>(response.record_count, body);
+    return body;
+}
+
+Result<std::vector<std::byte>> EncodeFetchResponseBody(const FetchResponse& response) {
+    if (response.base_offset < 0) {
+        return Status::InvalidArgument("fetch response base_offset must not be negative");
+    }
+    if (response.high_watermark < 0) {
+        return Status::InvalidArgument("fetch response high_watermark must not be negative");
+    }
+    if (response.records.size() > std::numeric_limits<std::uint32_t>::max()) {
+        return Status::InvalidArgument("fetch response contains too many records");
+    }
+
+    std::vector<std::byte> body;
+    AppendBigEndian<std::uint64_t>(static_cast<std::uint64_t>(response.base_offset), body);
+    AppendBigEndian<std::uint64_t>(static_cast<std::uint64_t>(response.high_watermark), body);
+    AppendBigEndian<std::uint32_t>(static_cast<std::uint32_t>(response.records.size()), body);
+    for (const ProtocolRecord& record : response.records) {
+        Status status = AppendProtocolRecord(record, body);
+        if (!status.ok()) {
+            return status;
+        }
+    }
+    return body;
+}
+
+Result<std::vector<std::byte>> EncodeMetadataResponseBody(const MetadataResponse& response) {
+    if (response.topics.size() > std::numeric_limits<std::uint32_t>::max()) {
+        return Status::InvalidArgument("metadata response contains too many topics");
+    }
+
+    std::vector<std::byte> body;
+    AppendBigEndian<std::uint32_t>(static_cast<std::uint32_t>(response.topics.size()), body);
+    for (const TopicMetadata& topic : response.topics) {
+        Status status = AppendString(topic.topic, body);
+        if (!status.ok()) {
+            return status;
+        }
+        AppendBigEndian<std::uint32_t>(topic.partition_count, body);
+    }
+    return body;
+}
+
+Result<std::vector<std::byte>> EncodeCreateTopicResponseBody(
+    const CreateTopicResponse& response) {
+    std::vector<std::byte> body;
+    Status status = AppendString(response.topic, body);
+    if (!status.ok()) {
+        return status;
+    }
+    AppendBigEndian<std::uint32_t>(response.partition_count, body);
+    return body;
+}
+
+Result<std::vector<std::byte>> EncodeResponseBody(const ResponseEnvelope& response) {
+    // The api_key selects the response schema. This keeps callers from sending
+    // a MetadataResponse inside a Produce frame by mistake.
+    switch (response.api_key) {
+        case ApiKey::kProduce:
+            if (!std::holds_alternative<ProduceResponse>(response.body)) {
+                return Status::InvalidArgument("produce response envelope has wrong body type");
+            }
+            return EncodeProduceResponseBody(std::get<ProduceResponse>(response.body));
+        case ApiKey::kFetch:
+            if (!std::holds_alternative<FetchResponse>(response.body)) {
+                return Status::InvalidArgument("fetch response envelope has wrong body type");
+            }
+            return EncodeFetchResponseBody(std::get<FetchResponse>(response.body));
+        case ApiKey::kMetadata:
+            if (!std::holds_alternative<MetadataResponse>(response.body)) {
+                return Status::InvalidArgument("metadata response envelope has wrong body type");
+            }
+            return EncodeMetadataResponseBody(std::get<MetadataResponse>(response.body));
+        case ApiKey::kCreateTopic:
+            if (!std::holds_alternative<CreateTopicResponse>(response.body)) {
+                return Status::InvalidArgument("create topic response envelope has wrong body type");
+            }
+            return EncodeCreateTopicResponseBody(std::get<CreateTopicResponse>(response.body));
+    }
+    return Status::InvalidArgument("unknown api key");
+}
+
+ResponseBody EmptyResponseBodyFor(ApiKey api_key) {
+    // Error responses have no success payload, but keeping the matching variant
+    // alternative makes decoded responses easier to inspect in tests and clients.
+    switch (api_key) {
+        case ApiKey::kProduce:
+            return ResponseBody{std::in_place_type<ProduceResponse>};
+        case ApiKey::kFetch:
+            return ResponseBody{std::in_place_type<FetchResponse>};
+        case ApiKey::kMetadata:
+            return ResponseBody{std::in_place_type<MetadataResponse>};
+        case ApiKey::kCreateTopic:
+            return ResponseBody{std::in_place_type<CreateTopicResponse>};
+    }
+    return ResponseBody{std::in_place_type<ProduceResponse>};
+}
+
+Result<ProduceResponse> DecodeProduceResponseBody(BodyReader& reader) {
+    auto base_offset = reader.ReadUInt<std::uint64_t>();
+    if (!base_offset.ok()) {
+        return base_offset.status();
+    }
+    auto record_count = reader.ReadUInt<std::uint32_t>();
+    if (!record_count.ok()) {
+        return record_count.status();
+    }
+
+    ProduceResponse response;
+    response.base_offset = static_cast<Offset>(base_offset.value());
+    response.record_count = record_count.value();
+    return response;
+}
+
+Result<FetchResponse> DecodeFetchResponseBody(BodyReader& reader) {
+    auto base_offset = reader.ReadUInt<std::uint64_t>();
+    if (!base_offset.ok()) {
+        return base_offset.status();
+    }
+    auto high_watermark = reader.ReadUInt<std::uint64_t>();
+    if (!high_watermark.ok()) {
+        return high_watermark.status();
+    }
+    auto record_count = reader.ReadUInt<std::uint32_t>();
+    if (!record_count.ok()) {
+        return record_count.status();
+    }
+
+    FetchResponse response;
+    response.base_offset = static_cast<Offset>(base_offset.value());
+    response.high_watermark = static_cast<Offset>(high_watermark.value());
+    response.records.reserve(record_count.value());
+    for (std::uint32_t i = 0; i < record_count.value(); ++i) {
+        auto record = DecodeProtocolRecord(reader);
+        if (!record.ok()) {
+            return record.status();
+        }
+        response.records.push_back(std::move(record).value());
+    }
+    return response;
+}
+
+Result<MetadataResponse> DecodeMetadataResponseBody(BodyReader& reader) {
+    auto topic_count = reader.ReadUInt<std::uint32_t>();
+    if (!topic_count.ok()) {
+        return topic_count.status();
+    }
+
+    MetadataResponse response;
+    response.topics.reserve(topic_count.value());
+    for (std::uint32_t i = 0; i < topic_count.value(); ++i) {
+        auto topic = reader.ReadString();
+        if (!topic.ok()) {
+            return topic.status();
+        }
+        auto partition_count = reader.ReadUInt<std::uint32_t>();
+        if (!partition_count.ok()) {
+            return partition_count.status();
+        }
+        response.topics.push_back(TopicMetadata{std::move(topic).value(), partition_count.value()});
+    }
+    return response;
+}
+
+Result<CreateTopicResponse> DecodeCreateTopicResponseBody(BodyReader& reader) {
+    auto topic = reader.ReadString();
+    if (!topic.ok()) {
+        return topic.status();
+    }
+    auto partition_count = reader.ReadUInt<std::uint32_t>();
+    if (!partition_count.ok()) {
+        return partition_count.status();
+    }
+
+    CreateTopicResponse response;
+    response.topic = std::move(topic).value();
+    response.partition_count = partition_count.value();
+    return response;
+}
+
+Result<ResponseBody> DecodeResponseBody(ApiKey api_key, BodyReader& reader) {
+    switch (api_key) {
+        case ApiKey::kProduce: {
+            auto response = DecodeProduceResponseBody(reader);
+            if (!response.ok()) {
+                return response.status();
+            }
+            return ResponseBody{std::in_place_type<ProduceResponse>, std::move(response).value()};
+        }
+        case ApiKey::kFetch: {
+            auto response = DecodeFetchResponseBody(reader);
+            if (!response.ok()) {
+                return response.status();
+            }
+            return ResponseBody{std::in_place_type<FetchResponse>, std::move(response).value()};
+        }
+        case ApiKey::kMetadata: {
+            auto response = DecodeMetadataResponseBody(reader);
+            if (!response.ok()) {
+                return response.status();
+            }
+            return ResponseBody{std::in_place_type<MetadataResponse>, std::move(response).value()};
+        }
+        case ApiKey::kCreateTopic: {
+            auto response = DecodeCreateTopicResponseBody(reader);
+            if (!response.ok()) {
+                return response.status();
+            }
+            return ResponseBody{std::in_place_type<CreateTopicResponse>, std::move(response).value()};
+        }
     }
     return Status::InvalidArgument("unknown api key");
 }
@@ -502,6 +742,38 @@ Result<RequestEnvelope> DecodeRequest(std::span<const std::byte> frame) {
     return envelope;
 }
 
+Result<std::vector<std::byte>> EncodeResponse(const ResponseEnvelope& response) {
+    if (response.version != kProtocolVersion) {
+        return Status::InvalidArgument("unsupported protocol version");
+    }
+
+    std::vector<std::byte> body;
+    AppendBigEndian<std::uint16_t>(static_cast<std::uint16_t>(response.error.error_code), body);
+    Status status = AppendString(response.error.message, body);
+    if (!status.ok()) {
+        return status;
+    }
+
+    // All responses start with the common error envelope. Only success appends
+    // the api-specific typed payload.
+    if (response.error.error_code == ProtocolErrorCode::kNone) {
+        auto success_body = EncodeResponseBody(response);
+        if (!success_body.ok()) {
+            return success_body.status();
+        }
+        AppendBytes(success_body.value(), body);
+    }
+
+    std::vector<std::byte> output;
+    output.reserve(kFrameHeaderBytes + body.size());
+    status = AppendFrameHeader(response.api_key, response.version, response.request_id, body, output);
+    if (!status.ok()) {
+        return status;
+    }
+    AppendBytes(body, output);
+    return output;
+}
+
 Result<std::vector<std::byte>> EncodeErrorResponse(ApiKey api_key, 
                                                    std::uint16_t version, 
                                                    std::uint64_t request_id, 
@@ -572,9 +844,6 @@ Result<ResponseEnvelope> DecodeResponse(std::span<const std::byte> frame) {
     if (!message.ok()) {
         return message.status();
     }
-    if (!reader.consumed()) {
-        return Status::InvalidArgument("response has trailing bytes");
-    }
 
     ResponseEnvelope response;
     response.api_key = api_key.value();
@@ -582,6 +851,20 @@ Result<ResponseEnvelope> DecodeResponse(std::span<const std::byte> frame) {
     response.request_id = request_id.value();
     response.error.error_code = error_code.value();
     response.error.message = std::move(message).value();
+    // The common error envelope has already been decoded. Success responses now
+    // consume the remaining bytes as the api-specific payload.
+    if (response.error.error_code == ProtocolErrorCode::kNone) {
+        auto body = DecodeResponseBody(response.api_key, reader);
+        if (!body.ok()) {
+            return body.status();
+        }
+        response.body = std::move(body).value();
+    } else {
+        response.body = EmptyResponseBodyFor(response.api_key);
+    }
+    if (!reader.consumed()) {
+        return Status::InvalidArgument("response has trailing bytes");
+    }
     return response;
 }
 

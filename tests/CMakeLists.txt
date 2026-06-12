@@ -38,10 +38,43 @@ if(GTest_FOUND)
         GTest::gtest_main
     )
 
+    add_executable(logmq_broker_service_test
+        unit/broker_service_test.cpp
+    )
+
+    target_link_libraries(logmq_broker_service_test
+        PRIVATE
+        logmq::core
+        GTest::gtest_main
+    )
+
+    add_executable(logmq_net_test
+        unit/net_test.cpp
+    )
+
+    target_link_libraries(logmq_net_test
+        PRIVATE
+        logmq::core
+        GTest::gtest_main
+    )
+
+    add_executable(logmq_network_test
+        integration/network_test.cpp
+    )
+
+    target_link_libraries(logmq_network_test
+        PRIVATE
+        logmq::core
+        GTest::gtest_main
+    )
+
     include(GoogleTest)
     gtest_discover_tests(logmq_base_test)
     gtest_discover_tests(logmq_storage_test)
     gtest_discover_tests(logmq_protocol_test)
+    gtest_discover_tests(logmq_broker_service_test)
+    gtest_discover_tests(logmq_net_test)
+    gtest_discover_tests(logmq_network_test)
 elseif(TARGET PkgConfig::GTEST)
     add_executable(logmq_base_test
         unit/base_test.cpp
@@ -73,10 +106,43 @@ elseif(TARGET PkgConfig::GTEST)
         PkgConfig::GTEST
     )
 
+    add_executable(logmq_broker_service_test
+        unit/broker_service_test.cpp
+    )
+
+    target_link_libraries(logmq_broker_service_test
+        PRIVATE
+        logmq::core
+        PkgConfig::GTEST
+    )
+
+    add_executable(logmq_net_test
+        unit/net_test.cpp
+    )
+
+    target_link_libraries(logmq_net_test
+        PRIVATE
+        logmq::core
+        PkgConfig::GTEST
+    )
+
+    add_executable(logmq_network_test
+        integration/network_test.cpp
+    )
+
+    target_link_libraries(logmq_network_test
+        PRIVATE
+        logmq::core
+        PkgConfig::GTEST
+    )
+
     include(GoogleTest)
     gtest_discover_tests(logmq_base_test)
     gtest_discover_tests(logmq_storage_test)
     gtest_discover_tests(logmq_protocol_test)
+    gtest_discover_tests(logmq_broker_service_test)
+    gtest_discover_tests(logmq_net_test)
+    gtest_discover_tests(logmq_network_test)
 else()
     message(WARNING "GoogleTest not found; building smoke test only.")
 
