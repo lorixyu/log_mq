@@ -68,7 +68,13 @@ int main(int argc, char** argv) {
 
         logmq::BrokerService service(logmq::BrokerServiceOptions{config.storage});
         logmq::TcpServer server(logmq::TcpServerOptionsFromConfig(config), &service);
-        logmq::Status status = server.Start();
+        logmq::Status status = service.Start();
+        if (!status.ok()) {
+            std::cerr << status.ToString() << "\n";
+            return 1;
+        }
+
+        status = server.Start();
         if (!status.ok()) {
             std::cerr << status.ToString() << "\n";
             return 1;

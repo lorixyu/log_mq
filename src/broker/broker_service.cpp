@@ -42,16 +42,33 @@ ProtocolErrorCode InvalidOrInternal(const Status& status) {
 
 BrokerService::BrokerService(BrokerServiceOptions options)
     : options_(std::move(options)),
-      topics_(TopicManagerOptionsFromConfig(options_.storage)) {
+      topics_(TopicManagerOptionsFromConfig(options_.storage)) {}
+
+BrokerService::~BrokerService() {
+    (void)Close();
+}
+
+Status BrokerService::Start() {
+    std::lock_guard lock(close_mutex_);
+    if (started_) {
+        return Status::Ok();
+    }
+    if (closed_) {
+        return Status::InvalidArgument("broker service is closed");
+    }
+
+    Status status = topics_.Load();
+    if (!status.ok()) {
+        return status;
+    }
+
     if (options_.storage.flush_policy == FlushPolicy::kAsync &&
         options_.storage.flush_interval.count() > 0) {
         // Async flush
         flusher_ = std::thread([this] { RunAsyncFlusher(); });
     }
-}
-
-BrokerService::~BrokerService() {
-    (void)Close();
+    started_ = true;
+    return Status::Ok();
 }
 
 ResponseEnvelope BrokerService::Handle(const RequestEnvelope& request) {
@@ -111,7 +128,8 @@ ResponseEnvelope BrokerService::HandleProduce(const RequestEnvelope& envelope,
                          "produce request must contain at least one record");
     }
 
-    auto partition = topics_.GetPartition(request.topic, request.partition_id);
+    const std::string_view key = request.records.front().key;
+    auto partition = topics_.SelectPartition(request.topic, request.partition_id, key);
     if (!partition.ok()) {
         return MakeError(envelope, ProtocolErrorCode::kTopicNotFound,
                          std::string(partition.status().message()));
@@ -123,14 +141,14 @@ ResponseEnvelope BrokerService::HandleProduce(const RequestEnvelope& envelope,
         records.push_back(ToStorageRecord(record));
     }
 
-    auto appended = partition.value()->log.Append(std::move(records));
+    auto appended = partition.value().partition->log.Append(std::move(records));
     if (!appended.ok()) {
         return MakeError(envelope, InvalidOrInternal(appended.status()),
                          std::string(appended.status().message()));
     }
 
     if (options_.storage.flush_policy == FlushPolicy::kSync) {
-        Status status = partition.value()->log.Flush();
+        Status status = partition.value().partition->log.Flush();
         if (!status.ok()) {
             return MakeError(envelope, ProtocolErrorCode::kInternal,
                              std::string(status.message()));
@@ -139,6 +157,7 @@ ResponseEnvelope BrokerService::HandleProduce(const RequestEnvelope& envelope,
 
     ProduceResponse response;
     // A batch append assigns one contiguous offset range.
+    response.partition_id = partition.value().id;
     response.base_offset = appended.value().base_offset;
     response.record_count = static_cast<std::uint32_t>(request.records.size());
     return MakeSuccess(envelope, ResponseBody{std::in_place_type<ProduceResponse>, response});

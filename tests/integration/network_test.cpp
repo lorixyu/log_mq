@@ -52,6 +52,10 @@ public:
         service_options.storage.data_dir = temp_dir_.path();
         service_options.storage.segment_bytes = 1024 * 1024;
         service_ = std::make_unique<BrokerService>(std::move(service_options));
+        Status service_status = service_->Start();
+        if (!service_status.ok()) {
+            throw std::runtime_error(service_status.ToString());
+        }
 
         TcpServerOptions server_options;
         server_options.host = "127.0.0.1";
@@ -210,6 +214,7 @@ TEST(NetworkIntegrationTest, LoopbackCreateProduceFetch) {
 
     auto produce = RoundTrip(server.port(), ProduceRequestEnvelope(2, "orders", 0, "k1", "v1"));
     ASSERT_EQ(produce.error.error_code, ProtocolErrorCode::kNone) << produce.error.message;
+    EXPECT_EQ(std::get<ProduceResponse>(produce.body).partition_id, 0);
     EXPECT_EQ(std::get<ProduceResponse>(produce.body).base_offset, 0);
 
     auto fetch = RoundTrip(server.port(), FetchRequestEnvelope(3, "orders", 0, 0));
@@ -218,6 +223,29 @@ TEST(NetworkIntegrationTest, LoopbackCreateProduceFetch) {
     ASSERT_EQ(body.records.size(), 1U);
     EXPECT_EQ(body.records[0].key, "k1");
     EXPECT_EQ(body.records[0].value, "v1");
+}
+
+TEST(NetworkIntegrationTest, LoopbackAutoPartitionProduceFetch) {
+    RunningServer server;
+
+    auto create = RoundTrip(server.port(), CreateTopicRequestEnvelope(1, "auto", 4));
+    ASSERT_EQ(create.error.error_code, ProtocolErrorCode::kNone) << create.error.message;
+
+    auto produce = RoundTrip(
+        server.port(), ProduceRequestEnvelope(2, "auto", kInvalidPartitionId, "k1", "v1"));
+    ASSERT_EQ(produce.error.error_code, ProtocolErrorCode::kNone) << produce.error.message;
+    const auto& produce_body = std::get<ProduceResponse>(produce.body);
+    ASSERT_GE(produce_body.partition_id, 0);
+    ASSERT_LT(produce_body.partition_id, 4);
+    EXPECT_EQ(produce_body.base_offset, 0);
+
+    auto fetch = RoundTrip(server.port(),
+                           FetchRequestEnvelope(3, "auto", produce_body.partition_id, 0));
+    ASSERT_EQ(fetch.error.error_code, ProtocolErrorCode::kNone) << fetch.error.message;
+    const auto& fetch_body = std::get<FetchResponse>(fetch.body);
+    ASSERT_EQ(fetch_body.records.size(), 1U);
+    EXPECT_EQ(fetch_body.records[0].key, "k1");
+    EXPECT_EQ(fetch_body.records[0].value, "v1");
 }
 
 TEST(NetworkIntegrationTest, HandlesStickyFramesOnOneConnection) {

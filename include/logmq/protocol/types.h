@@ -92,6 +92,7 @@ struct ErrorResponse {
 // Produce returns the logical offset range assigned to the appended batch.
 // Clients can derive [base_offset, base_offset + record_count).
 struct ProduceResponse {
+    PartitionId partition_id{kInvalidPartitionId};
     Offset base_offset{kInvalidOffset};
     std::uint32_t record_count{0};
 };

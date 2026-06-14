@@ -72,6 +72,28 @@ TEST(ProtocolCodecTest, EncodesAndDecodesSingleProduceFrame) {
     EXPECT_EQ(request.records[1].value, "value-2");
 }
 
+TEST(ProtocolCodecTest, EncodesAndDecodesAutoPartitionProduceFrame) {
+    ProduceRequest request;
+    request.topic = "orders";
+    request.partition_id = kInvalidPartitionId;
+    request.records.push_back(ProtocolRecord{1'700'200'000, "key-1", "value-1"});
+
+    RequestEnvelope envelope;
+    envelope.api_key = ApiKey::kProduce;
+    envelope.version = kProtocolVersion;
+    envelope.request_id = 101;
+    envelope.body = std::move(request);
+
+    auto encoded = EncodeRequest(envelope);
+    ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+
+    auto decoded = DecodeRequest(AsBytes(encoded.value()));
+    ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+    ASSERT_TRUE(std::holds_alternative<ProduceRequest>(decoded.value().body));
+    const auto& decoded_request = std::get<ProduceRequest>(decoded.value().body);
+    EXPECT_EQ(decoded_request.partition_id, kInvalidPartitionId);
+}
+
 TEST(ProtocolCodecTest, FrameDecoderKeepsPartialFrameBuffered) {
     auto encoded = EncodeRequest(MakeFetchEnvelope(100));
     ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
@@ -194,7 +216,11 @@ TEST(ProtocolCodecTest, EncodesAndDecodesProduceSuccessResponse) {
     response.version = kProtocolVersion;
     response.request_id = 501;
     response.error = ErrorResponse{ProtocolErrorCode::kNone, ""};
-    response.body = ProduceResponse{42, 3};
+    ProduceResponse produce;
+    produce.partition_id = 2;
+    produce.base_offset = 42;
+    produce.record_count = 3;
+    response.body = produce;
 
     auto encoded = EncodeResponse(response);
     ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
@@ -207,6 +233,7 @@ TEST(ProtocolCodecTest, EncodesAndDecodesProduceSuccessResponse) {
 
     ASSERT_TRUE(std::holds_alternative<ProduceResponse>(decoded.value().body));
     const auto& body = std::get<ProduceResponse>(decoded.value().body);
+    EXPECT_EQ(body.partition_id, 2);
     EXPECT_EQ(body.base_offset, 42);
     EXPECT_EQ(body.record_count, 3U);
 }

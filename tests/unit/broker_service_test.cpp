@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <filesystem>
 #include <mutex>
@@ -84,6 +85,7 @@ BrokerService MakeService(const TempDir& temp_dir) {
 TEST(BrokerServiceTest, CreateTopicProduceAndFetch) {
     TempDir temp_dir;
     auto service = MakeService(temp_dir);
+    ASSERT_TRUE(service.Start().ok());
 
     auto create = service.Handle(MakeCreateTopic(1, "orders", 2));
     ASSERT_EQ(create.error.error_code, ProtocolErrorCode::kNone) << create.error.message;
@@ -93,6 +95,7 @@ TEST(BrokerServiceTest, CreateTopicProduceAndFetch) {
     auto produce = service.Handle(MakeProduce(2, "orders", 1, "k1", "v1"));
     ASSERT_EQ(produce.error.error_code, ProtocolErrorCode::kNone) << produce.error.message;
     ASSERT_TRUE(std::holds_alternative<ProduceResponse>(produce.body));
+    EXPECT_EQ(std::get<ProduceResponse>(produce.body).partition_id, 1);
     EXPECT_EQ(std::get<ProduceResponse>(produce.body).base_offset, 0);
 
     auto fetch = service.Handle(MakeFetch(3, "orders", 1, 0));
@@ -111,6 +114,7 @@ TEST(BrokerServiceTest, CreateTopicProduceAndFetch) {
 TEST(BrokerServiceTest, MetadataSupportsSingleTopicAndAllTopics) {
     TempDir temp_dir;
     auto service = MakeService(temp_dir);
+    ASSERT_TRUE(service.Start().ok());
 
     ASSERT_EQ(service.Handle(MakeCreateTopic(1, "orders", 3)).error.error_code,
               ProtocolErrorCode::kNone);
@@ -134,9 +138,46 @@ TEST(BrokerServiceTest, MetadataSupportsSingleTopicAndAllTopics) {
     ASSERT_TRUE(service.Close().ok());
 }
 
+TEST(BrokerServiceTest, TopicMetadataPersistsAcrossRestart) {
+    TempDir temp_dir;
+    {
+        auto service = MakeService(temp_dir);
+        ASSERT_TRUE(service.Start().ok());
+        ASSERT_EQ(service.Handle(MakeCreateTopic(1, "orders", 3)).error.error_code,
+                  ProtocolErrorCode::kNone);
+        ASSERT_EQ(service.Handle(MakeCreateTopic(2, "payments", 1)).error.error_code,
+                  ProtocolErrorCode::kNone);
+        ASSERT_EQ(service.Handle(MakeProduce(3, "orders", 2, "k", "v")).error.error_code,
+                  ProtocolErrorCode::kNone);
+        ASSERT_TRUE(service.Close().ok());
+    }
+
+    auto service = MakeService(temp_dir);
+    ASSERT_TRUE(service.Start().ok());
+
+    auto metadata = service.Handle(MakeMetadata(4, ""));
+    ASSERT_EQ(metadata.error.error_code, ProtocolErrorCode::kNone) << metadata.error.message;
+    const auto& metadata_body = std::get<MetadataResponse>(metadata.body);
+    ASSERT_EQ(metadata_body.topics.size(), 2U);
+    EXPECT_EQ(metadata_body.topics[0].topic, "orders");
+    EXPECT_EQ(metadata_body.topics[0].partition_count, 3U);
+    EXPECT_EQ(metadata_body.topics[1].topic, "payments");
+    EXPECT_EQ(metadata_body.topics[1].partition_count, 1U);
+
+    auto fetch = service.Handle(MakeFetch(5, "orders", 2, 0));
+    ASSERT_EQ(fetch.error.error_code, ProtocolErrorCode::kNone) << fetch.error.message;
+    const auto& fetch_body = std::get<FetchResponse>(fetch.body);
+    ASSERT_EQ(fetch_body.records.size(), 1U);
+    EXPECT_EQ(fetch_body.records[0].key, "k");
+    EXPECT_EQ(fetch_body.records[0].value, "v");
+
+    ASSERT_TRUE(service.Close().ok());
+}
+
 TEST(BrokerServiceTest, RejectsInvalidRequests) {
     TempDir temp_dir;
     auto service = MakeService(temp_dir);
+    ASSERT_TRUE(service.Start().ok());
 
     EXPECT_EQ(service.Handle(MakeProduce(1, "missing", 0, "k", "v")).error.error_code,
               ProtocolErrorCode::kTopicNotFound);
@@ -146,6 +187,8 @@ TEST(BrokerServiceTest, RejectsInvalidRequests) {
 
     EXPECT_EQ(service.Handle(MakeCreateTopic(3, "orders", 2)).error.error_code,
               ProtocolErrorCode::kInvalidRequest);
+    EXPECT_EQ(service.Handle(MakeCreateTopic(30, "orders", 1)).error.error_code,
+              ProtocolErrorCode::kNone);
     EXPECT_EQ(service.Handle(MakeProduce(4, "orders", 4, "k", "v")).error.error_code,
               ProtocolErrorCode::kTopicNotFound);
     EXPECT_EQ(service.Handle(MakeFetch(5, "orders", 0, 10)).error.error_code,
@@ -163,9 +206,29 @@ TEST(BrokerServiceTest, RejectsInvalidRequests) {
     ASSERT_TRUE(service.Close().ok());
 }
 
+TEST(BrokerServiceTest, RejectsInvalidTopicNames) {
+    TempDir temp_dir;
+    auto service = MakeService(temp_dir);
+    ASSERT_TRUE(service.Start().ok());
+
+    EXPECT_EQ(service.Handle(MakeCreateTopic(1, "", 1)).error.error_code,
+              ProtocolErrorCode::kInvalidRequest);
+    EXPECT_EQ(service.Handle(MakeCreateTopic(2, ".", 1)).error.error_code,
+              ProtocolErrorCode::kInvalidRequest);
+    EXPECT_EQ(service.Handle(MakeCreateTopic(3, "..", 1)).error.error_code,
+              ProtocolErrorCode::kInvalidRequest);
+    EXPECT_EQ(service.Handle(MakeCreateTopic(4, "bad/name", 1)).error.error_code,
+              ProtocolErrorCode::kInvalidRequest);
+    EXPECT_EQ(service.Handle(MakeCreateTopic(5, "bad name", 1)).error.error_code,
+              ProtocolErrorCode::kInvalidRequest);
+
+    ASSERT_TRUE(service.Close().ok());
+}
+
 TEST(BrokerServiceTest, ConcurrentProduceAssignsUniqueOffsets) {
     TempDir temp_dir;
     auto service = MakeService(temp_dir);
+    ASSERT_TRUE(service.Start().ok());
     ASSERT_EQ(service.Handle(MakeCreateTopic(1, "orders", 1)).error.error_code,
               ProtocolErrorCode::kNone);
 
@@ -198,6 +261,90 @@ TEST(BrokerServiceTest, ConcurrentProduceAssignsUniqueOffsets) {
     std::sort(offsets.begin(), offsets.end());
     for (Offset offset = 0; offset < static_cast<Offset>(offsets.size()); ++offset) {
         EXPECT_EQ(offsets[static_cast<std::size_t>(offset)], offset);
+    }
+
+    ASSERT_TRUE(service.Close().ok());
+}
+
+TEST(BrokerServiceTest, AutoPartitionUsesStableKeyHashAndRoundRobin) {
+    TempDir temp_dir;
+    auto service = MakeService(temp_dir);
+    ASSERT_TRUE(service.Start().ok());
+    ASSERT_EQ(service.Handle(MakeCreateTopic(1, "keyed", 4)).error.error_code,
+              ProtocolErrorCode::kNone);
+    ASSERT_EQ(service.Handle(MakeCreateTopic(2, "rr", 4)).error.error_code,
+              ProtocolErrorCode::kNone);
+
+    PartitionId keyed_partition = kInvalidPartitionId;
+    for (int i = 0; i < 100; ++i) {
+        auto response = service.Handle(
+            MakeProduce(static_cast<std::uint64_t>(100 + i), "keyed", kInvalidPartitionId,
+                        "same-key", "v"));
+        ASSERT_EQ(response.error.error_code, ProtocolErrorCode::kNone)
+            << response.error.message;
+        const auto& body = std::get<ProduceResponse>(response.body);
+        if (i == 0) {
+            keyed_partition = body.partition_id;
+        }
+        EXPECT_EQ(body.partition_id, keyed_partition);
+    }
+
+    std::array<int, 4> counts{};
+    for (int i = 0; i < 8; ++i) {
+        auto response = service.Handle(
+            MakeProduce(static_cast<std::uint64_t>(300 + i), "rr", kInvalidPartitionId, "",
+                        "v"));
+        ASSERT_EQ(response.error.error_code, ProtocolErrorCode::kNone)
+            << response.error.message;
+        const auto partition = std::get<ProduceResponse>(response.body).partition_id;
+        ASSERT_GE(partition, 0);
+        ASSERT_LT(partition, static_cast<PartitionId>(counts.size()));
+        ++counts[static_cast<std::size_t>(partition)];
+    }
+    for (int count : counts) {
+        EXPECT_EQ(count, 2);
+    }
+
+    ASSERT_TRUE(service.Close().ok());
+}
+
+TEST(BrokerServiceTest, ConcurrentProduceAcrossPartitionsKeepsOffsetsLocal) {
+    TempDir temp_dir;
+    auto service = MakeService(temp_dir);
+    ASSERT_TRUE(service.Start().ok());
+    ASSERT_EQ(service.Handle(MakeCreateTopic(1, "parallel", 8)).error.error_code,
+              ProtocolErrorCode::kNone);
+
+    constexpr int kPartitions = 8;
+    constexpr int kPerPartition = 64;
+    std::array<std::vector<Offset>, kPartitions> offsets;
+    std::array<std::mutex, kPartitions> mutexes;
+
+    std::vector<std::thread> threads;
+    for (int partition = 0; partition < kPartitions; ++partition) {
+        threads.emplace_back([&, partition] {
+            for (int i = 0; i < kPerPartition; ++i) {
+                auto response = service.Handle(MakeProduce(
+                    static_cast<std::uint64_t>(1000 + partition * kPerPartition + i),
+                    "parallel", partition, "k", "v"));
+                ASSERT_EQ(response.error.error_code, ProtocolErrorCode::kNone)
+                    << response.error.message;
+                Offset offset = std::get<ProduceResponse>(response.body).base_offset;
+                std::lock_guard lock(mutexes[static_cast<std::size_t>(partition)]);
+                offsets[static_cast<std::size_t>(partition)].push_back(offset);
+            }
+        });
+    }
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    for (auto& partition_offsets : offsets) {
+        ASSERT_EQ(partition_offsets.size(), static_cast<std::size_t>(kPerPartition));
+        std::sort(partition_offsets.begin(), partition_offsets.end());
+        for (Offset offset = 0; offset < kPerPartition; ++offset) {
+            EXPECT_EQ(partition_offsets[static_cast<std::size_t>(offset)], offset);
+        }
     }
 
     ASSERT_TRUE(service.Close().ok());

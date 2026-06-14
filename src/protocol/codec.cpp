@@ -1,6 +1,7 @@
 #include "logmq/protocol/codec.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <limits>
 #include <string>
 #include <type_traits>
@@ -134,6 +135,19 @@ Result<ProtocolErrorCode> ParseProtocolErrorCode(std::uint16_t value) {
     return Status::InvalidArgument("unknown protocol error code");
 }
 
+void AppendPartitionId(PartitionId partition_id, std::vector<std::byte>& output) {
+    AppendBigEndian<std::uint32_t>(static_cast<std::uint32_t>(partition_id), output);
+}
+
+PartitionId DecodePartitionId(std::uint32_t value) {
+    if (value <= static_cast<std::uint32_t>(std::numeric_limits<PartitionId>::max())) {
+        return static_cast<PartitionId>(value);
+    }
+    const auto signed_value = static_cast<std::int64_t>(value) -
+                              (static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max()) + 1);
+    return static_cast<PartitionId>(signed_value);
+}
+
 Status ValidateFrame(std::span<const std::byte> frame) {
     if (frame.size() < kFrameHeaderBytes) {
         return Status::InvalidArgument("protocol frame header is truncated");
@@ -169,7 +183,7 @@ Result<std::vector<std::byte>> EncodeProduceBody(const ProduceRequest& request) 
     if (!status.ok()) {
         return status;
     }
-    AppendBigEndian<std::uint32_t>(static_cast<std::uint32_t>(request.partition_id), body);
+    AppendPartitionId(request.partition_id, body);
     AppendBigEndian<std::uint32_t>(static_cast<std::uint32_t>(request.records.size()), body);
 
     for (const ProtocolRecord& record : request.records) {
@@ -192,7 +206,7 @@ Result<std::vector<std::byte>> EncodeFetchBody(const FetchRequest& request) {
     if (!status.ok()) {
         return status;
     }
-    AppendBigEndian<std::uint32_t>(static_cast<std::uint32_t>(request.partition_id), body);
+    AppendPartitionId(request.partition_id, body);
     AppendBigEndian<std::uint64_t>(static_cast<std::uint64_t>(request.offset), body);
     AppendBigEndian<std::uint32_t>(request.max_bytes, body);
     return body;
@@ -268,7 +282,7 @@ Result<ProduceRequest> DecodeProduceBody(std::span<const std::byte> body) {
 
     ProduceRequest request;
     request.topic = std::move(topic).value();
-    request.partition_id = static_cast<PartitionId>(partition.value());
+    request.partition_id = DecodePartitionId(partition.value());
     request.records.reserve(record_count.value());
 
     for (std::uint32_t i = 0; i < record_count.value(); ++i) {
@@ -309,7 +323,7 @@ Result<FetchRequest> DecodeFetchBody(std::span<const std::byte> body) {
 
     FetchRequest request;
     request.topic = std::move(topic).value();
-    request.partition_id = static_cast<PartitionId>(partition.value());
+    request.partition_id = DecodePartitionId(partition.value());
     request.offset = static_cast<Offset>(offset.value());
     request.max_bytes = max_bytes.value();
     return request;
@@ -377,11 +391,15 @@ Result<std::vector<std::byte>> EncodeRequestBody(const RequestEnvelope& request)
 }
 
 Result<std::vector<std::byte>> EncodeProduceResponseBody(const ProduceResponse& response) {
+    if (response.partition_id < 0) {
+        return Status::InvalidArgument("produce response partition_id must not be negative");
+    }
     if (response.base_offset < 0) {
         return Status::InvalidArgument("produce response base_offset must not be negative");
     }
 
     std::vector<std::byte> body;
+    AppendPartitionId(response.partition_id, body);
     AppendBigEndian<std::uint64_t>(static_cast<std::uint64_t>(response.base_offset), body);
     AppendBigEndian<std::uint32_t>(response.record_count, body);
     return body;
@@ -484,6 +502,10 @@ ResponseBody EmptyResponseBodyFor(ApiKey api_key) {
 }
 
 Result<ProduceResponse> DecodeProduceResponseBody(BodyReader& reader) {
+    auto partition_id = reader.ReadUInt<std::uint32_t>();
+    if (!partition_id.ok()) {
+        return partition_id.status();
+    }
     auto base_offset = reader.ReadUInt<std::uint64_t>();
     if (!base_offset.ok()) {
         return base_offset.status();
@@ -494,6 +516,7 @@ Result<ProduceResponse> DecodeProduceResponseBody(BodyReader& reader) {
     }
 
     ProduceResponse response;
+    response.partition_id = DecodePartitionId(partition_id.value());
     response.base_offset = static_cast<Offset>(base_offset.value());
     response.record_count = record_count.value();
     return response;

@@ -31,7 +31,7 @@ void PrintUsage() {
               << "Commands:\n"
               << "  create-topic --topic TOPIC --partitions N\n"
               << "  metadata [--topic TOPIC]\n"
-              << "  produce --topic TOPIC --partition N --key KEY --value VALUE [--timestamp TS]\n"
+              << "  produce --topic TOPIC [--partition N] --key KEY --value VALUE [--timestamp TS]\n"
               << "  fetch --topic TOPIC --partition N --offset OFFSET [--max-bytes N]\n";
 }
 
@@ -206,8 +206,10 @@ logmq::RequestEnvelope BuildRequest(int argc, char** argv, const CliOptions& opt
         envelope.api_key = logmq::ApiKey::kProduce;
         logmq::ProduceRequest request;
         request.topic = RequiredOption(argc, argv, options.command_index, "--topic");
-        request.partition_id = static_cast<logmq::PartitionId>(
-            std::stoi(RequiredOption(argc, argv, options.command_index, "--partition")));
+        const std::string partition = OptionValue(argc, argv, options.command_index, "--partition");
+        request.partition_id = partition.empty()
+                                   ? logmq::kInvalidPartitionId
+                                   : static_cast<logmq::PartitionId>(std::stoi(partition));
         const std::string timestamp = OptionValue(argc, argv, options.command_index, "--timestamp");
         request.records.push_back(logmq::ProtocolRecord{
             timestamp.empty() ? NowTimestamp() : std::stoull(timestamp),
@@ -258,8 +260,8 @@ int PrintResponse(const logmq::ResponseEnvelope& response) {
         }
         case logmq::ApiKey::kProduce: {
             const auto& body = std::get<logmq::ProduceResponse>(response.body);
-            std::cout << "base_offset=" << body.base_offset << " record_count="
-                      << body.record_count << "\n";
+            std::cout << "partition=" << body.partition_id << " base_offset="
+                      << body.base_offset << " record_count=" << body.record_count << "\n";
             return 0;
         }
         case logmq::ApiKey::kFetch: {

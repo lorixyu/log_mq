@@ -21,6 +21,8 @@ public:
     explicit BrokerService(BrokerServiceOptions options);
     ~BrokerService();
 
+    [[nodiscard]] Status Start();
+
     [[nodiscard]] ResponseEnvelope Handle(const RequestEnvelope& request);
 
     [[nodiscard]] Status Close();
@@ -53,6 +55,7 @@ private:
     std::mutex flusher_mutex_;  // To ensure that releasing the lock and entering sleep are atomic.
     std::condition_variable flusher_condition_;
     std::mutex close_mutex_;
+    bool started_{false};
     bool closed_{false};
 };
 
