@@ -69,6 +69,7 @@ CommitLog& CommitLog::operator=(CommitLog&& other) noexcept {
     return *this;
 }
 
+// 重启/恢复 一个 Partition 里的 Segemnts;
 Result<CommitLog> CommitLog::Open(CommitLogOptions options) {
     if (options.data_dir.empty()) {
         return Status::InvalidArgument("commit log data_dir must not be empty");
