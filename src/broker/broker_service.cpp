@@ -42,7 +42,8 @@ ProtocolErrorCode InvalidOrInternal(const Status& status) {
 
 BrokerService::BrokerService(BrokerServiceOptions options)
     : options_(std::move(options)),
-      topics_(TopicManagerOptionsFromConfig(options_.storage)) {}
+      topics_(TopicManagerOptionsFromConfig(options_.storage)),
+      offsets_(OffsetStoreOptionsFromDataDir(options_.storage.data_dir)) {}
 
 BrokerService::~BrokerService() {
     (void)Close();
@@ -58,6 +59,10 @@ Status BrokerService::Start() {
     }
 
     Status status = topics_.Load();
+    if (!status.ok()) {
+        return status;
+    }
+    status = offsets_.Load();
     if (!status.ok()) {
         return status;
     }
@@ -102,6 +107,19 @@ ResponseEnvelope BrokerService::Handle(const RequestEnvelope& request) {
                                  "create topic request envelope has wrong body type");
             }
             return HandleCreateTopic(request, std::get<CreateTopicRequest>(request.body));
+        case ApiKey::kCommitOffset:
+            if (!std::holds_alternative<CommitOffsetRequest>(request.body)) {
+                return MakeError(request, ProtocolErrorCode::kInvalidRequest,
+                                 "commit offset request envelope has wrong body type");
+            }
+            return HandleCommitOffset(request, std::get<CommitOffsetRequest>(request.body));
+        case ApiKey::kFetchCommittedOffset:
+            if (!std::holds_alternative<FetchCommittedOffsetRequest>(request.body)) {
+                return MakeError(request, ProtocolErrorCode::kInvalidRequest,
+                                 "fetch committed offset request envelope has wrong body type");
+            }
+            return HandleFetchCommittedOffset(
+                request, std::get<FetchCommittedOffsetRequest>(request.body));
     }
 
     return MakeError(request, ProtocolErrorCode::kInvalidRequest, "unknown api key");
@@ -180,6 +198,19 @@ ResponseEnvelope BrokerService::HandleFetch(const RequestEnvelope& envelope,
                          std::string(partition.status().message()));
     }
 
+    const Offset high_watermark = partition.value()->log.next_offset();
+    if (request.offset == high_watermark) {
+        FetchResponse response;
+        response.base_offset = request.offset;
+        response.high_watermark = high_watermark;
+        return MakeSuccess(envelope,
+                           ResponseBody{std::in_place_type<FetchResponse>, std::move(response)});
+    }
+    if (request.offset > high_watermark) {
+        return MakeError(envelope, ProtocolErrorCode::kOffsetOutOfRange,
+                         "fetch offset is beyond high watermark");
+    }
+
     auto batch = partition.value()->log.Read(request.offset, request.max_bytes);
     if (!batch.ok()) {
         ProtocolErrorCode code = batch.status().code() == ErrorCode::kNotFound
@@ -192,7 +223,7 @@ ResponseEnvelope BrokerService::HandleFetch(const RequestEnvelope& envelope,
     response.base_offset = batch.value().base_offset;
     // In the single-broker version, all appended records are immediately visible.
     // Replication can later replace this with the replicated high watermark.
-    response.high_watermark = partition.value()->log.next_offset();
+    response.high_watermark = high_watermark;
     response.records.reserve(batch.value().records.size());
     for (const Record& record : batch.value().records) {
         response.records.push_back(ToProtocolRecord(record));
@@ -226,6 +257,66 @@ ResponseEnvelope BrokerService::HandleCreateTopic(const RequestEnvelope& envelop
     response.partition_count = request.partition_count;
     return MakeSuccess(envelope,
                        ResponseBody{std::in_place_type<CreateTopicResponse>, std::move(response)});
+}
+
+ResponseEnvelope BrokerService::HandleCommitOffset(const RequestEnvelope& envelope,
+                                                   const CommitOffsetRequest& request) {
+    if (request.offset < 0) {
+        return MakeError(envelope, ProtocolErrorCode::kInvalidRequest,
+                         "commit offset must not be negative");
+    }
+
+    auto partition = topics_.GetPartition(request.topic, request.partition_id);
+    if (!partition.ok()) {
+        return MakeError(envelope, ProtocolErrorCode::kTopicNotFound,
+                         std::string(partition.status().message()));
+    }
+
+    if (request.offset > partition.value()->log.next_offset()) {
+        return MakeError(envelope, ProtocolErrorCode::kOffsetOutOfRange,
+                         "commit offset is beyond high watermark");
+    }
+
+    Status status = offsets_.Commit(request.group_id, request.topic, request.partition_id,
+                                    request.offset);
+    if (!status.ok()) {
+        return MakeError(envelope, InvalidOrInternal(status), std::string(status.message()));
+    }
+
+    CommitOffsetResponse response;
+    response.group_id = request.group_id;
+    response.topic = request.topic;
+    response.partition_id = request.partition_id;
+    response.offset = request.offset;
+    return MakeSuccess(envelope,
+                       ResponseBody{std::in_place_type<CommitOffsetResponse>,
+                                    std::move(response)});
+}
+
+ResponseEnvelope BrokerService::HandleFetchCommittedOffset(
+    const RequestEnvelope& envelope,
+    const FetchCommittedOffsetRequest& request) {
+    auto partition = topics_.GetPartition(request.topic, request.partition_id);
+    if (!partition.ok()) {
+        return MakeError(envelope, ProtocolErrorCode::kTopicNotFound,
+                         std::string(partition.status().message()));
+    }
+
+    auto offset = offsets_.Fetch(request.group_id, request.topic, request.partition_id);
+    if (!offset.ok()) {
+        return MakeError(envelope, InvalidOrInternal(offset.status()),
+                         std::string(offset.status().message()));
+    }
+
+    FetchCommittedOffsetResponse response;
+    response.group_id = request.group_id;
+    response.topic = request.topic;
+    response.partition_id = request.partition_id;
+    response.committed = offset.value().has_value();
+    response.offset = response.committed ? *offset.value() : 0;
+    return MakeSuccess(envelope,
+                       ResponseBody{std::in_place_type<FetchCommittedOffsetResponse>,
+                                    std::move(response)});
 }
 
 ResponseEnvelope BrokerService::MakeError(const RequestEnvelope& envelope,

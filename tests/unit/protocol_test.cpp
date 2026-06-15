@@ -210,6 +210,56 @@ TEST(ProtocolCodecTest, EncodesAndDecodesCreateTopicRequest) {
     EXPECT_EQ(create_topic.partition_count, 6U);
 }
 
+TEST(ProtocolCodecTest, EncodesAndDecodesCommitOffsetRequest) {
+    CommitOffsetRequest request;
+    request.group_id = "order-service";
+    request.topic = "orders";
+    request.partition_id = 2;
+    request.offset = 43;
+
+    RequestEnvelope envelope;
+    envelope.api_key = ApiKey::kCommitOffset;
+    envelope.version = kProtocolVersion;
+    envelope.request_id = 45;
+    envelope.body = std::move(request);
+
+    auto encoded = EncodeRequest(envelope);
+    ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+    auto decoded = DecodeRequest(AsBytes(encoded.value()));
+    ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+
+    ASSERT_TRUE(std::holds_alternative<CommitOffsetRequest>(decoded.value().body));
+    const auto& commit = std::get<CommitOffsetRequest>(decoded.value().body);
+    EXPECT_EQ(commit.group_id, "order-service");
+    EXPECT_EQ(commit.topic, "orders");
+    EXPECT_EQ(commit.partition_id, 2);
+    EXPECT_EQ(commit.offset, 43);
+}
+
+TEST(ProtocolCodecTest, EncodesAndDecodesFetchCommittedOffsetRequest) {
+    FetchCommittedOffsetRequest request;
+    request.group_id = "order-service";
+    request.topic = "orders";
+    request.partition_id = 2;
+
+    RequestEnvelope envelope;
+    envelope.api_key = ApiKey::kFetchCommittedOffset;
+    envelope.version = kProtocolVersion;
+    envelope.request_id = 46;
+    envelope.body = std::move(request);
+
+    auto encoded = EncodeRequest(envelope);
+    ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+    auto decoded = DecodeRequest(AsBytes(encoded.value()));
+    ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+
+    ASSERT_TRUE(std::holds_alternative<FetchCommittedOffsetRequest>(decoded.value().body));
+    const auto& fetch = std::get<FetchCommittedOffsetRequest>(decoded.value().body);
+    EXPECT_EQ(fetch.group_id, "order-service");
+    EXPECT_EQ(fetch.topic, "orders");
+    EXPECT_EQ(fetch.partition_id, 2);
+}
+
 TEST(ProtocolCodecTest, EncodesAndDecodesProduceSuccessResponse) {
     ResponseEnvelope response;
     response.api_key = ApiKey::kProduce;
@@ -236,6 +286,53 @@ TEST(ProtocolCodecTest, EncodesAndDecodesProduceSuccessResponse) {
     EXPECT_EQ(body.partition_id, 2);
     EXPECT_EQ(body.base_offset, 42);
     EXPECT_EQ(body.record_count, 3U);
+}
+
+TEST(ProtocolCodecTest, EncodesAndDecodesCommitOffsetSuccessResponse) {
+    ResponseEnvelope response;
+    response.api_key = ApiKey::kCommitOffset;
+    response.version = kProtocolVersion;
+    response.request_id = 506;
+    response.error = ErrorResponse{ProtocolErrorCode::kNone, ""};
+    response.body = CommitOffsetResponse{"order-service", "orders", 2, 43};
+
+    auto encoded = EncodeResponse(response);
+    ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+
+    auto decoded = DecodeResponse(AsBytes(encoded.value()));
+    ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+    ASSERT_TRUE(std::holds_alternative<CommitOffsetResponse>(decoded.value().body));
+    const auto& body = std::get<CommitOffsetResponse>(decoded.value().body);
+    EXPECT_EQ(body.group_id, "order-service");
+    EXPECT_EQ(body.topic, "orders");
+    EXPECT_EQ(body.partition_id, 2);
+    EXPECT_EQ(body.offset, 43);
+}
+
+TEST(ProtocolCodecTest, EncodesAndDecodesFetchCommittedOffsetSuccessResponse) {
+    for (const bool committed : {false, true}) {
+        ResponseEnvelope response;
+        response.api_key = ApiKey::kFetchCommittedOffset;
+        response.version = kProtocolVersion;
+        response.request_id = committed ? 508 : 507;
+        response.error = ErrorResponse{ProtocolErrorCode::kNone, ""};
+        response.body =
+            FetchCommittedOffsetResponse{"order-service", "orders", 2, committed,
+                                         committed ? 43 : 0};
+
+        auto encoded = EncodeResponse(response);
+        ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+
+        auto decoded = DecodeResponse(AsBytes(encoded.value()));
+        ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+        ASSERT_TRUE(std::holds_alternative<FetchCommittedOffsetResponse>(decoded.value().body));
+        const auto& body = std::get<FetchCommittedOffsetResponse>(decoded.value().body);
+        EXPECT_EQ(body.group_id, "order-service");
+        EXPECT_EQ(body.topic, "orders");
+        EXPECT_EQ(body.partition_id, 2);
+        EXPECT_EQ(body.committed, committed);
+        EXPECT_EQ(body.offset, committed ? 43 : 0);
+    }
 }
 
 TEST(ProtocolCodecTest, EncodesAndDecodesFetchSuccessResponse) {

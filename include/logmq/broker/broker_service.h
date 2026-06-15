@@ -7,6 +7,7 @@
 
 #include "logmq/base/config.h"
 #include "logmq/base/result.h"
+#include "logmq/broker/offset_store.h"
 #include "logmq/broker/topic_manager.h"
 #include "logmq/protocol/types.h"
 
@@ -38,6 +39,11 @@ private:
                                                   const MetadataRequest& request);
     [[nodiscard]] ResponseEnvelope HandleCreateTopic(const RequestEnvelope& envelope,
                                                      const CreateTopicRequest& request);
+    [[nodiscard]] ResponseEnvelope HandleCommitOffset(const RequestEnvelope& envelope,
+                                                      const CommitOffsetRequest& request);
+    [[nodiscard]] ResponseEnvelope HandleFetchCommittedOffset(
+        const RequestEnvelope& envelope,
+        const FetchCommittedOffsetRequest& request);
 
     [[nodiscard]] ResponseEnvelope MakeError(const RequestEnvelope& envelope,
                                              ProtocolErrorCode code,
@@ -48,6 +54,7 @@ private:
 
     BrokerServiceOptions options_;
     TopicManager topics_;
+    OffsetStore offsets_;
     // Async mode batches durability work outside Produce; sync mode flushes
     // inside HandleProduce before returning success.
     std::thread flusher_;

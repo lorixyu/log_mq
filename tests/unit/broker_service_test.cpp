@@ -74,6 +74,31 @@ RequestEnvelope MakeMetadata(std::uint64_t request_id, std::string topic) {
     return envelope;
 }
 
+RequestEnvelope MakeCommitOffset(std::uint64_t request_id,
+                                 std::string group_id,
+                                 std::string topic,
+                                 PartitionId partition,
+                                 Offset offset) {
+    RequestEnvelope envelope;
+    envelope.api_key = ApiKey::kCommitOffset;
+    envelope.request_id = request_id;
+    envelope.body =
+        CommitOffsetRequest{std::move(group_id), std::move(topic), partition, offset};
+    return envelope;
+}
+
+RequestEnvelope MakeFetchCommittedOffset(std::uint64_t request_id,
+                                         std::string group_id,
+                                         std::string topic,
+                                         PartitionId partition) {
+    RequestEnvelope envelope;
+    envelope.api_key = ApiKey::kFetchCommittedOffset;
+    envelope.request_id = request_id;
+    envelope.body =
+        FetchCommittedOffsetRequest{std::move(group_id), std::move(topic), partition};
+    return envelope;
+}
+
 BrokerService MakeService(const TempDir& temp_dir) {
     BrokerServiceOptions options;
     options.storage.data_dir = temp_dir.path();
@@ -174,6 +199,45 @@ TEST(BrokerServiceTest, TopicMetadataPersistsAcrossRestart) {
     ASSERT_TRUE(service.Close().ok());
 }
 
+TEST(BrokerServiceTest, CommitOffsetPersistsAcrossRestart) {
+    TempDir temp_dir;
+    {
+        auto service = MakeService(temp_dir);
+        ASSERT_TRUE(service.Start().ok());
+        ASSERT_EQ(service.Handle(MakeCreateTopic(1, "orders", 1)).error.error_code,
+                  ProtocolErrorCode::kNone);
+        ASSERT_EQ(service.Handle(MakeProduce(2, "orders", 0, "k1", "v1")).error.error_code,
+                  ProtocolErrorCode::kNone);
+        ASSERT_EQ(service.Handle(MakeProduce(3, "orders", 0, "k2", "v2")).error.error_code,
+                  ProtocolErrorCode::kNone);
+
+        auto missing = service.Handle(MakeFetchCommittedOffset(4, "group-a", "orders", 0));
+        ASSERT_EQ(missing.error.error_code, ProtocolErrorCode::kNone) << missing.error.message;
+        const auto& missing_body = std::get<FetchCommittedOffsetResponse>(missing.body);
+        EXPECT_FALSE(missing_body.committed);
+        EXPECT_EQ(missing_body.offset, 0);
+
+        auto commit = service.Handle(MakeCommitOffset(5, "group-a", "orders", 0, 2));
+        ASSERT_EQ(commit.error.error_code, ProtocolErrorCode::kNone) << commit.error.message;
+        const auto& commit_body = std::get<CommitOffsetResponse>(commit.body);
+        EXPECT_EQ(commit_body.group_id, "group-a");
+        EXPECT_EQ(commit_body.topic, "orders");
+        EXPECT_EQ(commit_body.partition_id, 0);
+        EXPECT_EQ(commit_body.offset, 2);
+        ASSERT_TRUE(service.Close().ok());
+    }
+
+    auto service = MakeService(temp_dir);
+    ASSERT_TRUE(service.Start().ok());
+    auto fetched = service.Handle(MakeFetchCommittedOffset(6, "group-a", "orders", 0));
+    ASSERT_EQ(fetched.error.error_code, ProtocolErrorCode::kNone) << fetched.error.message;
+    const auto& body = std::get<FetchCommittedOffsetResponse>(fetched.body);
+    EXPECT_TRUE(body.committed);
+    EXPECT_EQ(body.offset, 2);
+
+    ASSERT_TRUE(service.Close().ok());
+}
+
 TEST(BrokerServiceTest, RejectsInvalidRequests) {
     TempDir temp_dir;
     auto service = MakeService(temp_dir);
@@ -193,6 +257,13 @@ TEST(BrokerServiceTest, RejectsInvalidRequests) {
               ProtocolErrorCode::kTopicNotFound);
     EXPECT_EQ(service.Handle(MakeFetch(5, "orders", 0, 10)).error.error_code,
               ProtocolErrorCode::kOffsetOutOfRange);
+
+    auto end = service.Handle(MakeFetch(50, "orders", 0, 0));
+    ASSERT_EQ(end.error.error_code, ProtocolErrorCode::kNone) << end.error.message;
+    const auto& end_body = std::get<FetchResponse>(end.body);
+    EXPECT_EQ(end_body.base_offset, 0);
+    EXPECT_EQ(end_body.high_watermark, 0);
+    EXPECT_TRUE(end_body.records.empty());
 
     ProduceRequest empty;
     empty.topic = "orders";
@@ -220,6 +291,37 @@ TEST(BrokerServiceTest, RejectsInvalidTopicNames) {
     EXPECT_EQ(service.Handle(MakeCreateTopic(4, "bad/name", 1)).error.error_code,
               ProtocolErrorCode::kInvalidRequest);
     EXPECT_EQ(service.Handle(MakeCreateTopic(5, "bad name", 1)).error.error_code,
+              ProtocolErrorCode::kInvalidRequest);
+
+    ASSERT_TRUE(service.Close().ok());
+}
+
+TEST(BrokerServiceTest, RejectsInvalidConsumerOffsets) {
+    TempDir temp_dir;
+    auto service = MakeService(temp_dir);
+    ASSERT_TRUE(service.Start().ok());
+    ASSERT_EQ(service.Handle(MakeCreateTopic(1, "orders", 1)).error.error_code,
+              ProtocolErrorCode::kNone);
+    ASSERT_EQ(service.Handle(MakeProduce(2, "orders", 0, "k", "v")).error.error_code,
+              ProtocolErrorCode::kNone);
+
+    EXPECT_EQ(service.Handle(MakeCommitOffset(3, "bad/group", "orders", 0, 1))
+                  .error.error_code,
+              ProtocolErrorCode::kInvalidRequest);
+    EXPECT_EQ(service.Handle(MakeCommitOffset(4, "group-a", "missing", 0, 1))
+                  .error.error_code,
+              ProtocolErrorCode::kTopicNotFound);
+    EXPECT_EQ(service.Handle(MakeCommitOffset(5, "group-a", "orders", 2, 1))
+                  .error.error_code,
+              ProtocolErrorCode::kTopicNotFound);
+    EXPECT_EQ(service.Handle(MakeCommitOffset(6, "group-a", "orders", 0, -1))
+                  .error.error_code,
+              ProtocolErrorCode::kInvalidRequest);
+    EXPECT_EQ(service.Handle(MakeCommitOffset(7, "group-a", "orders", 0, 2))
+                  .error.error_code,
+              ProtocolErrorCode::kOffsetOutOfRange);
+    EXPECT_EQ(service.Handle(MakeFetchCommittedOffset(8, "bad/group", "orders", 0))
+                  .error.error_code,
               ProtocolErrorCode::kInvalidRequest);
 
     ASSERT_TRUE(service.Close().ok());

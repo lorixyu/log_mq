@@ -113,6 +113,10 @@ Result<ApiKey> ParseApiKey(std::uint16_t value) {
             return ApiKey::kMetadata;
         case static_cast<std::uint16_t>(ApiKey::kCreateTopic):
             return ApiKey::kCreateTopic;
+        case static_cast<std::uint16_t>(ApiKey::kCommitOffset):
+            return ApiKey::kCommitOffset;
+        case static_cast<std::uint16_t>(ApiKey::kFetchCommittedOffset):
+            return ApiKey::kFetchCommittedOffset;
     }
     return Status::InvalidArgument("unknown api key");
 }
@@ -228,6 +232,40 @@ Result<std::vector<std::byte>> EncodeCreateTopicBody(const CreateTopicRequest& r
         return status;
     }
     AppendBigEndian<std::uint32_t>(request.partition_count, body);
+    return body;
+}
+
+Result<std::vector<std::byte>> EncodeCommitOffsetBody(const CommitOffsetRequest& request) {
+    if (request.offset < 0) {
+        return Status::InvalidArgument("commit offset request offset must not be negative");
+    }
+
+    std::vector<std::byte> body;
+    Status status = AppendString(request.group_id, body);
+    if (!status.ok()) {
+        return status;
+    }
+    status = AppendString(request.topic, body);
+    if (!status.ok()) {
+        return status;
+    }
+    AppendPartitionId(request.partition_id, body);
+    AppendBigEndian<std::uint64_t>(static_cast<std::uint64_t>(request.offset), body);
+    return body;
+}
+
+Result<std::vector<std::byte>> EncodeFetchCommittedOffsetBody(
+    const FetchCommittedOffsetRequest& request) {
+    std::vector<std::byte> body;
+    Status status = AppendString(request.group_id, body);
+    if (!status.ok()) {
+        return status;
+    }
+    status = AppendString(request.topic, body);
+    if (!status.ok()) {
+        return status;
+    }
+    AppendPartitionId(request.partition_id, body);
     return body;
 }
 
@@ -364,6 +402,62 @@ Result<CreateTopicRequest> DecodeCreateTopicBody(std::span<const std::byte> body
     return request;
 }
 
+Result<CommitOffsetRequest> DecodeCommitOffsetBody(std::span<const std::byte> body) {
+    BodyReader reader(body);
+    auto group_id = reader.ReadString();
+    if (!group_id.ok()) {
+        return group_id.status();
+    }
+    auto topic = reader.ReadString();
+    if (!topic.ok()) {
+        return topic.status();
+    }
+    auto partition = reader.ReadUInt<std::uint32_t>();
+    if (!partition.ok()) {
+        return partition.status();
+    }
+    auto offset = reader.ReadUInt<std::uint64_t>();
+    if (!offset.ok()) {
+        return offset.status();
+    }
+    if (!reader.consumed()) {
+        return Status::InvalidArgument("commit offset request has trailing bytes");
+    }
+
+    CommitOffsetRequest request;
+    request.group_id = std::move(group_id).value();
+    request.topic = std::move(topic).value();
+    request.partition_id = DecodePartitionId(partition.value());
+    request.offset = static_cast<Offset>(offset.value());
+    return request;
+}
+
+Result<FetchCommittedOffsetRequest> DecodeFetchCommittedOffsetBody(
+    std::span<const std::byte> body) {
+    BodyReader reader(body);
+    auto group_id = reader.ReadString();
+    if (!group_id.ok()) {
+        return group_id.status();
+    }
+    auto topic = reader.ReadString();
+    if (!topic.ok()) {
+        return topic.status();
+    }
+    auto partition = reader.ReadUInt<std::uint32_t>();
+    if (!partition.ok()) {
+        return partition.status();
+    }
+    if (!reader.consumed()) {
+        return Status::InvalidArgument("fetch committed offset request has trailing bytes");
+    }
+
+    FetchCommittedOffsetRequest request;
+    request.group_id = std::move(group_id).value();
+    request.topic = std::move(topic).value();
+    request.partition_id = DecodePartitionId(partition.value());
+    return request;
+}
+
 Result<std::vector<std::byte>> EncodeRequestBody(const RequestEnvelope& request) {
     switch (request.api_key) {
         case ApiKey::kProduce:
@@ -386,6 +480,18 @@ Result<std::vector<std::byte>> EncodeRequestBody(const RequestEnvelope& request)
                 return Status::InvalidArgument("create topic request envelope has wrong body type");
             }
             return EncodeCreateTopicBody(std::get<CreateTopicRequest>(request.body));
+        case ApiKey::kCommitOffset:
+            if (!std::holds_alternative<CommitOffsetRequest>(request.body)) {
+                return Status::InvalidArgument("commit offset request envelope has wrong body type");
+            }
+            return EncodeCommitOffsetBody(std::get<CommitOffsetRequest>(request.body));
+        case ApiKey::kFetchCommittedOffset:
+            if (!std::holds_alternative<FetchCommittedOffsetRequest>(request.body)) {
+                return Status::InvalidArgument(
+                    "fetch committed offset request envelope has wrong body type");
+            }
+            return EncodeFetchCommittedOffsetBody(
+                std::get<FetchCommittedOffsetRequest>(request.body));
     }
     return Status::InvalidArgument("unknown api key");
 }
@@ -457,6 +563,54 @@ Result<std::vector<std::byte>> EncodeCreateTopicResponseBody(
     return body;
 }
 
+Result<std::vector<std::byte>> EncodeCommitOffsetResponseBody(
+    const CommitOffsetResponse& response) {
+    if (response.partition_id < 0) {
+        return Status::InvalidArgument("commit offset response partition_id must not be negative");
+    }
+    if (response.offset < 0) {
+        return Status::InvalidArgument("commit offset response offset must not be negative");
+    }
+
+    std::vector<std::byte> body;
+    Status status = AppendString(response.group_id, body);
+    if (!status.ok()) {
+        return status;
+    }
+    status = AppendString(response.topic, body);
+    if (!status.ok()) {
+        return status;
+    }
+    AppendPartitionId(response.partition_id, body);
+    AppendBigEndian<std::uint64_t>(static_cast<std::uint64_t>(response.offset), body);
+    return body;
+}
+
+Result<std::vector<std::byte>> EncodeFetchCommittedOffsetResponseBody(
+    const FetchCommittedOffsetResponse& response) {
+    if (response.partition_id < 0) {
+        return Status::InvalidArgument(
+            "fetch committed offset response partition_id must not be negative");
+    }
+    if (response.offset < 0) {
+        return Status::InvalidArgument("fetch committed offset response offset must not be negative");
+    }
+
+    std::vector<std::byte> body;
+    Status status = AppendString(response.group_id, body);
+    if (!status.ok()) {
+        return status;
+    }
+    status = AppendString(response.topic, body);
+    if (!status.ok()) {
+        return status;
+    }
+    AppendPartitionId(response.partition_id, body);
+    AppendBigEndian<std::uint32_t>(response.committed ? 1U : 0U, body);
+    AppendBigEndian<std::uint64_t>(static_cast<std::uint64_t>(response.offset), body);
+    return body;
+}
+
 Result<std::vector<std::byte>> EncodeResponseBody(const ResponseEnvelope& response) {
     // The api_key selects the response schema. This keeps callers from sending
     // a MetadataResponse inside a Produce frame by mistake.
@@ -481,6 +635,18 @@ Result<std::vector<std::byte>> EncodeResponseBody(const ResponseEnvelope& respon
                 return Status::InvalidArgument("create topic response envelope has wrong body type");
             }
             return EncodeCreateTopicResponseBody(std::get<CreateTopicResponse>(response.body));
+        case ApiKey::kCommitOffset:
+            if (!std::holds_alternative<CommitOffsetResponse>(response.body)) {
+                return Status::InvalidArgument("commit offset response envelope has wrong body type");
+            }
+            return EncodeCommitOffsetResponseBody(std::get<CommitOffsetResponse>(response.body));
+        case ApiKey::kFetchCommittedOffset:
+            if (!std::holds_alternative<FetchCommittedOffsetResponse>(response.body)) {
+                return Status::InvalidArgument(
+                    "fetch committed offset response envelope has wrong body type");
+            }
+            return EncodeFetchCommittedOffsetResponseBody(
+                std::get<FetchCommittedOffsetResponse>(response.body));
     }
     return Status::InvalidArgument("unknown api key");
 }
@@ -497,6 +663,10 @@ ResponseBody EmptyResponseBodyFor(ApiKey api_key) {
             return ResponseBody{std::in_place_type<MetadataResponse>};
         case ApiKey::kCreateTopic:
             return ResponseBody{std::in_place_type<CreateTopicResponse>};
+        case ApiKey::kCommitOffset:
+            return ResponseBody{std::in_place_type<CommitOffsetResponse>};
+        case ApiKey::kFetchCommittedOffset:
+            return ResponseBody{std::in_place_type<FetchCommittedOffsetResponse>};
     }
     return ResponseBody{std::in_place_type<ProduceResponse>};
 }
@@ -588,6 +758,67 @@ Result<CreateTopicResponse> DecodeCreateTopicResponseBody(BodyReader& reader) {
     return response;
 }
 
+Result<CommitOffsetResponse> DecodeCommitOffsetResponseBody(BodyReader& reader) {
+    auto group_id = reader.ReadString();
+    if (!group_id.ok()) {
+        return group_id.status();
+    }
+    auto topic = reader.ReadString();
+    if (!topic.ok()) {
+        return topic.status();
+    }
+    auto partition = reader.ReadUInt<std::uint32_t>();
+    if (!partition.ok()) {
+        return partition.status();
+    }
+    auto offset = reader.ReadUInt<std::uint64_t>();
+    if (!offset.ok()) {
+        return offset.status();
+    }
+
+    CommitOffsetResponse response;
+    response.group_id = std::move(group_id).value();
+    response.topic = std::move(topic).value();
+    response.partition_id = DecodePartitionId(partition.value());
+    response.offset = static_cast<Offset>(offset.value());
+    return response;
+}
+
+Result<FetchCommittedOffsetResponse> DecodeFetchCommittedOffsetResponseBody(
+    BodyReader& reader) {
+    auto group_id = reader.ReadString();
+    if (!group_id.ok()) {
+        return group_id.status();
+    }
+    auto topic = reader.ReadString();
+    if (!topic.ok()) {
+        return topic.status();
+    }
+    auto partition = reader.ReadUInt<std::uint32_t>();
+    if (!partition.ok()) {
+        return partition.status();
+    }
+    auto committed = reader.ReadUInt<std::uint32_t>();
+    if (!committed.ok()) {
+        return committed.status();
+    }
+    if (committed.value() > 1) {
+        return Status::InvalidArgument("fetch committed offset response has invalid flag");
+    }
+    auto offset = reader.ReadUInt<std::uint64_t>();
+    if (!offset.ok()) {
+        return offset.status();
+    }
+
+    FetchCommittedOffsetResponse response;
+    response.group_id = std::move(group_id).value();
+    response.topic = std::move(topic).value();
+    response.partition_id = DecodePartitionId(partition.value());
+    response.committed = committed.value() == 1;
+    response.offset = static_cast<Offset>(offset.value());
+    return response;
+}
+
 Result<ResponseBody> DecodeResponseBody(ApiKey api_key, BodyReader& reader) {
     switch (api_key) {
         case ApiKey::kProduce: {
@@ -617,6 +848,22 @@ Result<ResponseBody> DecodeResponseBody(ApiKey api_key, BodyReader& reader) {
                 return response.status();
             }
             return ResponseBody{std::in_place_type<CreateTopicResponse>, std::move(response).value()};
+        }
+        case ApiKey::kCommitOffset: {
+            auto response = DecodeCommitOffsetResponseBody(reader);
+            if (!response.ok()) {
+                return response.status();
+            }
+            return ResponseBody{std::in_place_type<CommitOffsetResponse>,
+                                std::move(response).value()};
+        }
+        case ApiKey::kFetchCommittedOffset: {
+            auto response = DecodeFetchCommittedOffsetResponseBody(reader);
+            if (!response.ok()) {
+                return response.status();
+            }
+            return ResponseBody{std::in_place_type<FetchCommittedOffsetResponse>,
+                                std::move(response).value()};
         }
     }
     return Status::InvalidArgument("unknown api key");
@@ -653,6 +900,22 @@ Result<RequestBody> DecodeRequestBody(ApiKey api_key, std::span<const std::byte>
             }
             return RequestBody{std::in_place_type<CreateTopicRequest>, std::move(request).value()};
         }
+        case ApiKey::kCommitOffset: {
+            auto request = DecodeCommitOffsetBody(body);
+            if (!request.ok()) {
+                return request.status();
+            }
+            return RequestBody{std::in_place_type<CommitOffsetRequest>,
+                               std::move(request).value()};
+        }
+        case ApiKey::kFetchCommittedOffset: {
+            auto request = DecodeFetchCommittedOffsetBody(body);
+            if (!request.ok()) {
+                return request.status();
+            }
+            return RequestBody{std::in_place_type<FetchCommittedOffsetRequest>,
+                               std::move(request).value()};
+        }
     }
     return Status::InvalidArgument("unknown api key");
 }
@@ -676,6 +939,10 @@ std::string_view ApiKeyName(ApiKey api_key) {
             return "Metadata";
         case ApiKey::kCreateTopic:
             return "CreateTopic";
+        case ApiKey::kCommitOffset:
+            return "CommitOffset";
+        case ApiKey::kFetchCommittedOffset:
+            return "FetchCommittedOffset";
     }
     return "Unknown";
 }

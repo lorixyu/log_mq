@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "logmq/broker/broker_service.h"
+#include "logmq/client/client.h"
 #include "logmq/net/tcp_server.h"
 #include "logmq/protocol/codec.h"
 
@@ -188,6 +189,31 @@ RequestEnvelope FetchRequestEnvelope(std::uint64_t request_id, std::string topic
     return envelope;
 }
 
+RequestEnvelope CommitOffsetRequestEnvelope(std::uint64_t request_id,
+                                            std::string group_id,
+                                            std::string topic,
+                                            PartitionId partition,
+                                            Offset offset) {
+    RequestEnvelope envelope;
+    envelope.api_key = ApiKey::kCommitOffset;
+    envelope.request_id = request_id;
+    envelope.body =
+        CommitOffsetRequest{std::move(group_id), std::move(topic), partition, offset};
+    return envelope;
+}
+
+RequestEnvelope FetchCommittedOffsetRequestEnvelope(std::uint64_t request_id,
+                                                    std::string group_id,
+                                                    std::string topic,
+                                                    PartitionId partition) {
+    RequestEnvelope envelope;
+    envelope.api_key = ApiKey::kFetchCommittedOffset;
+    envelope.request_id = request_id;
+    envelope.body =
+        FetchCommittedOffsetRequest{std::move(group_id), std::move(topic), partition};
+    return envelope;
+}
+
 ResponseEnvelope RoundTrip(std::uint16_t port, const RequestEnvelope& request) {
     auto encoded = EncodeRequest(request);
     EXPECT_TRUE(encoded.ok()) << encoded.status().ToString();
@@ -246,6 +272,80 @@ TEST(NetworkIntegrationTest, LoopbackAutoPartitionProduceFetch) {
     ASSERT_EQ(fetch_body.records.size(), 1U);
     EXPECT_EQ(fetch_body.records[0].key, "k1");
     EXPECT_EQ(fetch_body.records[0].value, "v1");
+}
+
+TEST(NetworkIntegrationTest, LoopbackCommitAndFetchCommittedOffset) {
+    RunningServer server;
+
+    auto create = RoundTrip(server.port(), CreateTopicRequestEnvelope(1, "offsets", 1));
+    ASSERT_EQ(create.error.error_code, ProtocolErrorCode::kNone) << create.error.message;
+    auto produce = RoundTrip(server.port(), ProduceRequestEnvelope(2, "offsets", 0, "k", "v"));
+    ASSERT_EQ(produce.error.error_code, ProtocolErrorCode::kNone) << produce.error.message;
+
+    auto missing =
+        RoundTrip(server.port(), FetchCommittedOffsetRequestEnvelope(3, "group-a", "offsets", 0));
+    ASSERT_EQ(missing.error.error_code, ProtocolErrorCode::kNone) << missing.error.message;
+    EXPECT_FALSE(std::get<FetchCommittedOffsetResponse>(missing.body).committed);
+
+    auto commit =
+        RoundTrip(server.port(), CommitOffsetRequestEnvelope(4, "group-a", "offsets", 0, 1));
+    ASSERT_EQ(commit.error.error_code, ProtocolErrorCode::kNone) << commit.error.message;
+
+    auto fetched =
+        RoundTrip(server.port(), FetchCommittedOffsetRequestEnvelope(5, "group-a", "offsets", 0));
+    ASSERT_EQ(fetched.error.error_code, ProtocolErrorCode::kNone) << fetched.error.message;
+    const auto& body = std::get<FetchCommittedOffsetResponse>(fetched.body);
+    EXPECT_TRUE(body.committed);
+    EXPECT_EQ(body.offset, 1);
+}
+
+TEST(NetworkIntegrationTest, ClientSdkProducesPollsAndCommitsOffsets) {
+    RunningServer server;
+    ClientOptions options;
+    options.host = "127.0.0.1";
+    options.port = server.port();
+
+    AdminClient admin(options);
+    auto created = admin.CreateTopic("sdk", 2);
+    ASSERT_TRUE(created.ok()) << created.status().ToString();
+    auto metadata = admin.Metadata("sdk");
+    ASSERT_TRUE(metadata.ok()) << metadata.status().ToString();
+    ASSERT_EQ(metadata.value().topics.size(), 1U);
+    EXPECT_EQ(metadata.value().topics[0].partition_count, 2U);
+
+    Producer producer(ProducerOptions{options, 1});
+    auto produced = producer.Send("sdk", "key-a", "value-a");
+    ASSERT_TRUE(produced.ok()) << produced.status().ToString();
+    ASSERT_GE(produced.value().partition_id, 0);
+    ASSERT_LT(produced.value().partition_id, 2);
+
+    Consumer consumer(ConsumerOptions{options, "group-sdk", 4096});
+    auto subscribed = consumer.Subscribe("sdk");
+    ASSERT_TRUE(subscribed.ok()) << subscribed.status().ToString();
+    auto records = consumer.Poll(std::chrono::milliseconds(200));
+    ASSERT_TRUE(records.ok()) << records.status().ToString();
+    ASSERT_EQ(records.value().size(), 1U);
+    EXPECT_EQ(records.value()[0].key, "key-a");
+    EXPECT_EQ(records.value()[0].value, "value-a");
+    EXPECT_TRUE(consumer.CommitSync().ok());
+
+    Consumer resumed(ConsumerOptions{options, "group-sdk", 4096});
+    ASSERT_TRUE(resumed.Subscribe("sdk").ok());
+    auto empty = resumed.Poll(std::chrono::milliseconds(0));
+    ASSERT_TRUE(empty.ok()) << empty.status().ToString();
+    EXPECT_TRUE(empty.value().empty());
+}
+
+TEST(NetworkIntegrationTest, ClientSdkReturnsStatusOnConnectionFailure) {
+    ClientOptions options;
+    options.host = "127.0.0.1";
+    options.port = 9;
+    options.request_timeout = std::chrono::milliseconds(100);
+
+    Producer producer(ProducerOptions{options, 0});
+    auto produced = producer.Send("missing", "k", "v");
+    ASSERT_FALSE(produced.ok());
+    EXPECT_NE(produced.status().code(), ErrorCode::kOk);
 }
 
 TEST(NetworkIntegrationTest, HandlesStickyFramesOnOneConnection) {

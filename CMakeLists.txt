@@ -17,7 +17,9 @@ add_library(logmq_core
     src/base/config.cpp
     src/base/status.cpp
     src/broker/broker_service.cpp
+    src/broker/offset_store.cpp
     src/broker/topic_manager.cpp
+    src/client/client.cpp
     src/net/buffer.cpp
     src/net/channel.cpp
     src/net/event_loop.cpp

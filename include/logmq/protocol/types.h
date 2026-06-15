@@ -16,6 +16,8 @@ enum class ApiKey : std::uint16_t {
     kFetch = 2,
     kMetadata = 3,
     kCreateTopic = 4,
+    kCommitOffset = 5,
+    kFetchCommittedOffset = 6,
 };
 
 // Protocol-level errors carried by error responses.
@@ -70,9 +72,29 @@ struct CreateTopicRequest {
     std::uint32_t partition_count{0};
 };
 
+// Commit the next offset a consumer group should read for one partition.
+struct CommitOffsetRequest {
+    std::string group_id;
+    TopicName topic;
+    PartitionId partition_id{kInvalidPartitionId};
+    Offset offset{kInvalidOffset};
+};
+
+// Fetch the committed offset for one consumer group/topic/partition.
+struct FetchCommittedOffsetRequest {
+    std::string group_id;
+    TopicName topic;
+    PartitionId partition_id{kInvalidPartitionId};
+};
+
 // Decoded request body. RequestEnvelope::api_key must match the active 
 // variant alternative; EncodeRequest validates this before writing bytes.
-using RequestBody = std::variant<ProduceRequest, FetchRequest, MetadataRequest, CreateTopicRequest>;
+using RequestBody = std::variant<ProduceRequest,
+                                 FetchRequest,
+                                 MetadataRequest,
+                                 CreateTopicRequest,
+                                 CommitOffsetRequest,
+                                 FetchCommittedOffsetRequest>;
 
 // Complete decoded request frame. request_id is echoed by the response so a
 // client can match responses to in-flight requests on the same connection.
@@ -119,10 +141,30 @@ struct CreateTopicResponse {
     std::uint32_t partition_count{0};
 };
 
+struct CommitOffsetResponse {
+    std::string group_id;
+    TopicName topic;
+    PartitionId partition_id{kInvalidPartitionId};
+    Offset offset{kInvalidOffset};
+};
+
+struct FetchCommittedOffsetResponse {
+    std::string group_id;
+    TopicName topic;
+    PartitionId partition_id{kInvalidPartitionId};
+    bool committed{false};
+    Offset offset{0};
+};
+
 // Successful response payloads are typed by api_key, just like RequestBody.
 // Error responses keep the right empty alternative so callers can still inspect api_key.
 using ResponseBody =
-    std::variant<ProduceResponse, FetchResponse, MetadataResponse, CreateTopicResponse>;
+    std::variant<ProduceResponse,
+                 FetchResponse,
+                 MetadataResponse,
+                 CreateTopicResponse,
+                 CommitOffsetResponse,
+                 FetchCommittedOffsetResponse>;
 
 // Wire body layout is: error_code + message + optional success payload.
 // The success payload is present only when error_code == kNone.

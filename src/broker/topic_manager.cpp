@@ -158,11 +158,18 @@ Status TopicManager::CreateTopic(const TopicName& topic, std::uint32_t partition
 }
 
 Result<Partition*> TopicManager::GetPartition(const TopicName& topic, PartitionId partition_id) {
-    auto selection = SelectPartition(topic, partition_id, "");
-    if (!selection.ok()) {
-        return selection.status();
+    std::shared_lock lock(mutex_);
+    auto found = topics_.find(topic);
+    if (found == topics_.end()) {
+        return Status::NotFound("topic not found");
     }
-    return selection.value().partition;
+
+    Topic& selected_topic = *found->second;
+    if (partition_id < 0 ||
+        static_cast<std::size_t>(partition_id) >= selected_topic.partitions.size()) {
+        return Status::NotFound("partition not found");
+    }
+    return selected_topic.partitions[static_cast<std::size_t>(partition_id)].get();
 }
 
 Result<PartitionSelection> TopicManager::SelectPartition(const TopicName& topic,
