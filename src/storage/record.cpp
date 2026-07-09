@@ -9,6 +9,8 @@ namespace logmq {
 namespace {
 
 // Serialize value using little_endian order
+// 以小端序存储，0x12345678 -> [0x78] [0x56] [0x34] [0x12]
+// 按位操作天然小端序，memcpy存的内存序依赖平台实现。
 template <typename UInt>
 void AppendLittleEndian(UInt value, std::vector<std::byte>& output) {
     static_assert(std::is_unsigned_v<UInt>);
@@ -52,6 +54,7 @@ std::size_t EncodedRecordSize(const Record& record) {
     return kRecordHeaderBytes + record.key.size() + record.value.size();
 }
 
+// 计算crc，除过crc字段大小。
 std::uint32_t ComputeRecordCrc(const Record& record) {
     std::vector<std::byte> bytes;
     bytes.reserve(sizeof(std::uint64_t) + sizeof(std::uint32_t) + sizeof(std::uint32_t) +
@@ -66,6 +69,7 @@ std::uint32_t ComputeRecordCrc(const Record& record) {
     return Crc32(bytes);
 }
 
+// 将一整条 Record 编码后放入 output
 Status AppendEncodedRecord(const Record& record, std::vector<std::byte>& output) {
     Status status = ValidateStringSize("record key", record.key);
     if (!status.ok()) {
@@ -94,22 +98,20 @@ Result<DecodedRecord> DecodeRecord(std::span<const std::byte> data) {
         return Status::Corruption("record header is truncated");
     }
 
-    auto timestamp = ReadLittleEndian<std::uint64_t>(data, 0);
+    auto timestamp = ReadLittleEndian<std::uint64_t>(data, RecordHeader::kTimestampOffset);
     if (!timestamp.ok()) {
         return timestamp.status();
     }
-    auto key_size = ReadLittleEndian<std::uint32_t>(data, sizeof(std::uint64_t));
+    auto key_size = ReadLittleEndian<std::uint32_t>(data, RecordHeader::KKeyOffset);
     if (!key_size.ok()) {
         return key_size.status();
     }
-    auto value_size = ReadLittleEndian<std::uint32_t>(data, sizeof(std::uint64_t) + sizeof(std::uint32_t));
+    auto value_size = ReadLittleEndian<std::uint32_t>(data, RecordHeader::KValueOffset);
     if (!value_size.ok()) {
         return value_size.status();
     }
-    auto crc = ReadLittleEndian<std::uint32_t>( data, 
-                                                sizeof(std::uint64_t) + 
-                                                sizeof(std::uint32_t) + 
-                                                sizeof(std::uint32_t));
+    auto crc = ReadLittleEndian<std::uint32_t>(data, RecordHeader::KCrcoffset);
+                                                
     if (!crc.ok()) {
         return crc.status();
     }

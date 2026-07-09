@@ -9,6 +9,12 @@
 #include "logmq/base/result.h"
 
 namespace logmq {
+namespace RecordHeader {
+    inline constexpr std::uint64_t kTimestampOffset = 0;
+    inline constexpr std::uint32_t KKeyOffset = kTimestampOffset + sizeof(std::uint64_t);
+    inline constexpr std::uint32_t KValueOffset = KKeyOffset + sizeof(std::uint32_t);
+    inline constexpr std::uint32_t KCrcoffset = KValueOffset + sizeof(std::uint32_t);
+}
 
 // A key-value record    -[timestamp key value crc]
 struct Record {
@@ -18,12 +24,14 @@ struct Record {
     std::uint32_t crc32{0};
 };
 
+// 解码后的Record，记录一条 Record 的字节。
 struct DecodedRecord {
     Record record;
     std::size_t bytes_consumed{0};
 };
 
 // Size of the fixed header in bytes.
+// Header : [timestamp | key_size | value_size | crc]
 inline constexpr std::size_t kRecordHeaderBytes =
     sizeof(std::uint64_t) + sizeof(std::uint32_t) + sizeof(std::uint32_t) + sizeof(std::uint32_t);
 

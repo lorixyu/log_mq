@@ -136,7 +136,7 @@ Status File::Close() {
     }
 
     const int fd = fd_;
-    fd_ = -1;
+    fd_ = -1;// fd 所有权在 close 调用前就已经转移走了，之后无论close失败与否 对象都处于关闭状态。
     if (::close(fd) != 0) {
         return IoErrorFromErrno("close", path_);
     }
