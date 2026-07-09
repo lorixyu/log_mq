@@ -134,9 +134,11 @@ Status ProtocolErrorToStatus(const ResponseEnvelope& response) {
             return Status::Ok();
         case ProtocolErrorCode::kInvalidRequest:
         case ProtocolErrorCode::kUnsupportedVersion:
+        case ProtocolErrorCode::kIllegalGeneration:
             return Status::InvalidArgument(response.error.message);
         case ProtocolErrorCode::kTopicNotFound:
         case ProtocolErrorCode::kOffsetOutOfRange:
+        case ProtocolErrorCode::kUnknownMember:
             return Status::NotFound(response.error.message);
         case ProtocolErrorCode::kInternal:
             return Status::Internal(response.error.message);
@@ -280,6 +282,10 @@ Consumer::Consumer(ConsumerOptions options)
     : options_(std::move(options)),
       connection_(options_.client) {}
 
+Consumer::~Consumer() {
+    (void)Close();
+}
+
 Result<void> Consumer::Subscribe(TopicName topic) {
     AdminClient admin(options_.client);
     auto metadata = admin.Metadata(topic);
@@ -290,37 +296,61 @@ Result<void> Consumer::Subscribe(TopicName topic) {
         return Status::NotFound("topic not found");
     }
 
-    topic_ = std::move(topic);
-    assignments_.clear();
-    const std::uint32_t partition_count = metadata.value().topics.front().partition_count;
-    assignments_.reserve(partition_count);
-    for (std::uint32_t partition = 0; partition < partition_count; ++partition) {
-        auto committed = FetchCommittedOffset(static_cast<PartitionId>(partition));
-        if (!committed.ok()) {
-            return committed.status();
+    {
+        std::lock_guard lock(mutex_);
+        if (closed_) {
+            return Status::InvalidArgument("consumer is closed");
         }
-        assignments_.push_back(Assignment{
-            static_cast<PartitionId>(partition),
-            committed.value().committed ? committed.value().offset : 0});
+        topic_ = std::move(topic);
+        assignments_.clear();
+        needs_rejoin_ = false;
     }
+
+    auto joined = JoinAndSync();
+    if (!joined.ok()) {
+        return joined.status();
+    }
+    StartHeartbeat();
     return {};
 }
 
 Result<std::vector<ConsumerRecord>> Consumer::Poll(std::chrono::milliseconds timeout) {
-    if (topic_.empty()) {
-        return Status::InvalidArgument("consumer must subscribe before poll");
-    }
-
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     std::vector<ConsumerRecord> output;
     while (true) {
-        for (Assignment& assignment : assignments_) {
+        bool needs_rejoin = false;
+        {
+            std::lock_guard lock(mutex_);
+            if (topic_.empty()) {
+                return Status::InvalidArgument("consumer must subscribe before poll");
+            }
+            if (closed_) {
+                return Status::InvalidArgument("consumer is closed");
+            }
+            needs_rejoin = needs_rejoin_;
+        }
+        if (needs_rejoin) {
+            auto joined = JoinAndSync();
+            if (!joined.ok()) {
+                return joined.status();
+            }
+        }
+
+        TopicName topic;
+        std::vector<Assignment> assignments;
+        {
+            std::lock_guard lock(mutex_);
+            topic = topic_;
+            assignments = assignments_;
+        }
+
+        for (Assignment& assignment : assignments) {
             RequestEnvelope envelope;
             envelope.api_key = ApiKey::kFetch;
             envelope.version = kProtocolVersion;
             envelope.request_id = NextRequestId();
             envelope.body.emplace<FetchRequest>(
-                FetchRequest{topic_, assignment.partition_id,
+                FetchRequest{topic, assignment.partition_id,
                              assignment.next_offset, options_.max_bytes});
 
             auto fetch = TypedResponse<FetchResponse>(connection_.RoundTrip(envelope),
@@ -336,7 +366,7 @@ Result<std::vector<ConsumerRecord>> Consumer::Poll(std::chrono::milliseconds tim
                 if (offset < assignment.next_offset) {
                     continue;
                 }
-                output.push_back(ConsumerRecord{topic_,
+                output.push_back(ConsumerRecord{topic,
                                                 assignment.partition_id,
                                                 offset,
                                                 record.timestamp,
@@ -345,6 +375,20 @@ Result<std::vector<ConsumerRecord>> Consumer::Poll(std::chrono::milliseconds tim
                 next_offset = offset + 1;
             }
             assignment.next_offset = next_offset;
+        }
+
+        {
+            std::lock_guard lock(mutex_);
+            if (topic == topic_) {
+                for (const Assignment& updated : assignments) {
+                    for (Assignment& current : assignments_) {
+                        if (current.partition_id == updated.partition_id) {
+                            current.next_offset = updated.next_offset;
+                            break;
+                        }
+                    }
+                }
+            }
         }
 
         if (!output.empty() || timeout.count() == 0 ||
@@ -359,6 +403,7 @@ Result<void> Consumer::Seek(PartitionId partition_id, Offset offset) {
     if (offset < 0) {
         return Status::InvalidArgument("seek offset must not be negative");
     }
+    std::lock_guard lock(mutex_);
     for (Assignment& assignment : assignments_) {
         if (assignment.partition_id == partition_id) {
             assignment.next_offset = offset;
@@ -369,17 +414,27 @@ Result<void> Consumer::Seek(PartitionId partition_id, Offset offset) {
 }
 
 Result<void> Consumer::CommitSync() {
-    if (topic_.empty()) {
-        return Status::InvalidArgument("consumer must subscribe before commit");
+    TopicName topic;
+    std::vector<Assignment> assignments;
+    {
+        std::lock_guard lock(mutex_);
+        if (topic_.empty()) {
+            return Status::InvalidArgument("consumer must subscribe before commit");
+        }
+        if (closed_) {
+            return Status::InvalidArgument("consumer is closed");
+        }
+        topic = topic_;
+        assignments = assignments_;
     }
 
-    for (const Assignment& assignment : assignments_) {
+    for (const Assignment& assignment : assignments) {
         RequestEnvelope envelope;
         envelope.api_key = ApiKey::kCommitOffset;
         envelope.version = kProtocolVersion;
         envelope.request_id = NextRequestId();
         envelope.body.emplace<CommitOffsetRequest>(
-            CommitOffsetRequest{options_.group_id, topic_,
+            CommitOffsetRequest{options_.group_id, topic,
                                 assignment.partition_id,
                                 assignment.next_offset});
         auto committed = TypedResponse<CommitOffsetResponse>(connection_.RoundTrip(envelope),
@@ -392,17 +447,197 @@ Result<void> Consumer::CommitSync() {
     return {};
 }
 
+Result<void> Consumer::Close() {
+    std::string member_id;
+    {
+        std::lock_guard lock(mutex_);
+        if (closed_) {
+            return {};
+        }
+        closed_ = true;
+        heartbeat_stop_ = true;
+        member_id = member_id_;
+    }
+    heartbeat_condition_.notify_all();
+    if (heartbeat_thread_.joinable()) {
+        heartbeat_thread_.join();
+    }
+
+    if (!member_id.empty()) {
+        auto left = SendLeaveGroup(member_id);
+        if (!left.ok() && left.status().code() != ErrorCode::kNotFound) {
+            return left.status();
+        }
+    }
+
+    std::lock_guard lock(mutex_);
+    subscribed_ = false;
+    assignments_.clear();
+    member_id_.clear();
+    generation_id_ = 0;
+    needs_rejoin_ = false;
+    return {};
+}
+
+std::vector<PartitionId> Consumer::AssignedPartitions() const {
+    std::lock_guard lock(mutex_);
+    std::vector<PartitionId> partitions;
+    partitions.reserve(assignments_.size());
+    for (const Assignment& assignment : assignments_) {
+        partitions.push_back(assignment.partition_id);
+    }
+    return partitions;
+}
+
+Result<void> Consumer::JoinAndSync() {
+    TopicName topic;
+    std::string member_id;
+    {
+        std::lock_guard lock(mutex_);
+        if (topic_.empty()) {
+            return Status::InvalidArgument("consumer must subscribe before join group");
+        }
+        topic = topic_;
+        member_id = member_id_;
+    }
+
+    auto joined = SendJoinGroup(topic, member_id);
+    if (!joined.ok() && !member_id.empty() &&
+        joined.status().code() == ErrorCode::kNotFound) {
+        joined = SendJoinGroup(topic, "");
+    }
+    if (!joined.ok()) {
+        return joined.status();
+    }
+
+    auto synced = SendSyncGroup(joined.value());
+    if (!synced.ok()) {
+        return synced.status();
+    }
+
+    std::vector<Assignment> assignments;
+    assignments.reserve(synced.value().assignment.partition_ids.size());
+    for (PartitionId partition_id : synced.value().assignment.partition_ids) {
+        auto committed = FetchCommittedOffset(synced.value().assignment.topic, partition_id);
+        if (!committed.ok()) {
+            return committed.status();
+        }
+        assignments.push_back(Assignment{
+            partition_id,
+            committed.value().committed ? committed.value().offset : 0});
+    }
+
+    std::lock_guard lock(mutex_);
+    member_id_ = joined.value().member_id;
+    generation_id_ = joined.value().generation_id;
+    topic_ = synced.value().assignment.topic;
+    assignments_ = std::move(assignments);
+    subscribed_ = true;
+    needs_rejoin_ = false;
+    return {};
+}
+
 Result<FetchCommittedOffsetResponse> Consumer::FetchCommittedOffset(
-    PartitionId partition_id) const {
+    const TopicName& topic, PartitionId partition_id) const {
     RequestEnvelope envelope;
     envelope.api_key = ApiKey::kFetchCommittedOffset;
     envelope.version = kProtocolVersion;
     envelope.request_id = NextRequestId();
     envelope.body.emplace<FetchCommittedOffsetRequest>(
-        FetchCommittedOffsetRequest{options_.group_id, topic_, partition_id});
+        FetchCommittedOffsetRequest{options_.group_id, topic, partition_id});
     return TypedResponse<FetchCommittedOffsetResponse>(connection_.RoundTrip(envelope),
                                                        ApiKey::kFetchCommittedOffset,
                                                        "fetch committed offset");
+}
+
+Result<JoinGroupResponse> Consumer::SendJoinGroup(const TopicName& topic,
+                                                  const std::string& member_id) const {
+    RequestEnvelope envelope;
+    envelope.api_key = ApiKey::kJoinGroup;
+    envelope.version = kProtocolVersion;
+    envelope.request_id = NextRequestId();
+    envelope.body.emplace<JoinGroupRequest>(
+        JoinGroupRequest{options_.group_id, member_id, topic});
+    return TypedResponse<JoinGroupResponse>(connection_.RoundTrip(envelope),
+                                            ApiKey::kJoinGroup, "join group");
+}
+
+Result<SyncGroupResponse> Consumer::SendSyncGroup(const JoinGroupResponse& joined) const {
+    RequestEnvelope envelope;
+    envelope.api_key = ApiKey::kSyncGroup;
+    envelope.version = kProtocolVersion;
+    envelope.request_id = NextRequestId();
+    envelope.body.emplace<SyncGroupRequest>(
+        SyncGroupRequest{options_.group_id, joined.member_id, joined.generation_id});
+    return TypedResponse<SyncGroupResponse>(connection_.RoundTrip(envelope),
+                                            ApiKey::kSyncGroup, "sync group");
+}
+
+Result<void> Consumer::SendLeaveGroup(const std::string& member_id) const {
+    RequestEnvelope envelope;
+    envelope.api_key = ApiKey::kLeaveGroup;
+    envelope.version = kProtocolVersion;
+    envelope.request_id = NextRequestId();
+    envelope.body.emplace<LeaveGroupRequest>(
+        LeaveGroupRequest{options_.group_id, member_id});
+
+    auto response = connection_.RoundTrip(envelope);
+    if (!response.ok()) {
+        return response.status();
+    }
+    if (response.value().error.error_code == ProtocolErrorCode::kNone) {
+        return {};
+    }
+    return ProtocolErrorToStatus(response.value());
+}
+
+void Consumer::StartHeartbeat() {
+    std::lock_guard lock(mutex_);
+    if (heartbeat_thread_.joinable()) {
+        return;
+    }
+    heartbeat_stop_ = false;
+    heartbeat_thread_ = std::thread([this] { RunHeartbeat(); });
+}
+
+void Consumer::RunHeartbeat() {
+    std::unique_lock lock(mutex_);
+    while (true) {
+        const bool stopped = heartbeat_condition_.wait_for(
+            lock, options_.heartbeat_interval, [this] { return heartbeat_stop_; });
+        if (stopped || heartbeat_stop_) {
+            break;
+        }
+        if (!subscribed_ || needs_rejoin_ || member_id_.empty() || generation_id_ <= 0) {
+            continue;
+        }
+
+        const std::string member_id = member_id_;
+        const std::int32_t generation_id = generation_id_;
+        lock.unlock();
+
+        RequestEnvelope envelope;
+        envelope.api_key = ApiKey::kHeartbeat;
+        envelope.version = kProtocolVersion;
+        envelope.request_id = NextRequestId();
+        envelope.body.emplace<HeartbeatRequest>(
+            HeartbeatRequest{options_.group_id, member_id, generation_id});
+        auto response = connection_.RoundTrip(envelope);
+
+        lock.lock();
+        if (!response.ok()) {
+            continue;
+        }
+        if (response.value().error.error_code == ProtocolErrorCode::kUnknownMember) {
+            member_id_.clear();
+            generation_id_ = 0;
+            needs_rejoin_ = true;
+        } else if (response.value().error.error_code ==
+                   ProtocolErrorCode::kIllegalGeneration) {
+            generation_id_ = 0;
+            needs_rejoin_ = true;
+        }
+    }
 }
 
 }  // namespace logmq

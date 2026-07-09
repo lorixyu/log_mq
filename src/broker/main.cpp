@@ -66,7 +66,8 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        logmq::BrokerService service(logmq::BrokerServiceOptions{config.storage});
+        logmq::BrokerService service(logmq::BrokerServiceOptions{config.storage,
+                                                                  config.consumer});
         logmq::TcpServer server(logmq::TcpServerOptionsFromConfig(config), &service);
         logmq::Status status = service.Start();
         if (!status.ok()) {

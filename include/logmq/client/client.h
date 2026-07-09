@@ -1,8 +1,11 @@
 #pragma once
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "logmq/base/result.h"
@@ -66,6 +69,7 @@ struct ConsumerOptions {
     ClientOptions client;
     std::string group_id;
     std::uint32_t max_bytes{4096};
+    std::chrono::milliseconds heartbeat_interval{3000};
 };
 
 struct ConsumerRecord {
@@ -80,12 +84,15 @@ struct ConsumerRecord {
 class Consumer {
 public:
     explicit Consumer(ConsumerOptions options);
+    ~Consumer();
 
     [[nodiscard]] Result<void> Subscribe(TopicName topic);
     [[nodiscard]] Result<std::vector<ConsumerRecord>> Poll(
         std::chrono::milliseconds timeout);
     [[nodiscard]] Result<void> Seek(PartitionId partition_id, Offset offset);
     [[nodiscard]] Result<void> CommitSync();
+    [[nodiscard]] Result<void> Close();
+    [[nodiscard]] std::vector<PartitionId> AssignedPartitions() const;
 
 private:
     struct Assignment {
@@ -93,13 +100,30 @@ private:
         Offset next_offset{0};
     };
 
+    [[nodiscard]] Result<void> JoinAndSync();
     [[nodiscard]] Result<FetchCommittedOffsetResponse> FetchCommittedOffset(
-        PartitionId partition_id) const;
+        const TopicName& topic, PartitionId partition_id) const;
+    [[nodiscard]] Result<JoinGroupResponse> SendJoinGroup(const TopicName& topic,
+                                                          const std::string& member_id) const;
+    [[nodiscard]] Result<SyncGroupResponse> SendSyncGroup(
+        const JoinGroupResponse& joined) const;
+    [[nodiscard]] Result<void> SendLeaveGroup(const std::string& member_id) const;
+    void StartHeartbeat();
+    void RunHeartbeat();
 
     ConsumerOptions options_;
     ClientConnection connection_;
+    mutable std::mutex mutex_;
+    std::condition_variable heartbeat_condition_;
+    std::thread heartbeat_thread_;
     TopicName topic_;
+    std::string member_id_;
+    std::int32_t generation_id_{0};
     std::vector<Assignment> assignments_;
+    bool subscribed_{false};
+    bool closed_{false};
+    bool heartbeat_stop_{false};
+    bool needs_rejoin_{false};
 };
 
 }  // namespace logmq

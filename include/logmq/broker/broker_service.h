@@ -7,6 +7,7 @@
 
 #include "logmq/base/config.h"
 #include "logmq/base/result.h"
+#include "logmq/broker/group_coordinator.h"
 #include "logmq/broker/offset_store.h"
 #include "logmq/broker/topic_manager.h"
 #include "logmq/protocol/types.h"
@@ -15,6 +16,7 @@ namespace logmq {
 
 struct BrokerServiceOptions {
     StorageConfig storage;
+    ConsumerConfig consumer;
 };
 
 class BrokerService {
@@ -44,6 +46,14 @@ private:
     [[nodiscard]] ResponseEnvelope HandleFetchCommittedOffset(
         const RequestEnvelope& envelope,
         const FetchCommittedOffsetRequest& request);
+    [[nodiscard]] ResponseEnvelope HandleJoinGroup(const RequestEnvelope& envelope,
+                                                   const JoinGroupRequest& request);
+    [[nodiscard]] ResponseEnvelope HandleSyncGroup(const RequestEnvelope& envelope,
+                                                   const SyncGroupRequest& request);
+    [[nodiscard]] ResponseEnvelope HandleHeartbeat(const RequestEnvelope& envelope,
+                                                   const HeartbeatRequest& request);
+    [[nodiscard]] ResponseEnvelope HandleLeaveGroup(const RequestEnvelope& envelope,
+                                                    const LeaveGroupRequest& request);
 
     [[nodiscard]] ResponseEnvelope MakeError(const RequestEnvelope& envelope,
                                              ProtocolErrorCode code,
@@ -55,6 +65,7 @@ private:
     BrokerServiceOptions options_;
     TopicManager topics_;
     OffsetStore offsets_;
+    GroupCoordinator groups_;
     // Async mode batches durability work outside Produce; sync mode flushes
     // inside HandleProduce before returning success.
     std::thread flusher_;

@@ -38,12 +38,24 @@ ProtocolErrorCode InvalidOrInternal(const Status& status) {
     return ProtocolErrorCode::kInternal;
 }
 
+ProtocolErrorCode GroupErrorCode(const Status& status) {
+    if (status.code() == ErrorCode::kNotFound && status.message() == "unknown member") {
+        return ProtocolErrorCode::kUnknownMember;
+    }
+    if (status.code() == ErrorCode::kInvalidArgument &&
+        status.message() == "illegal generation") {
+        return ProtocolErrorCode::kIllegalGeneration;
+    }
+    return InvalidOrInternal(status);
+}
+
 }  // namespace
 
 BrokerService::BrokerService(BrokerServiceOptions options)
     : options_(std::move(options)),
       topics_(TopicManagerOptionsFromConfig(options_.storage)),
-      offsets_(OffsetStoreOptionsFromDataDir(options_.storage.data_dir)) {}
+      offsets_(OffsetStoreOptionsFromDataDir(options_.storage.data_dir)),
+      groups_(GroupCoordinatorOptionsFromConfig(options_.consumer)) {}
 
 BrokerService::~BrokerService() {
     (void)Close();
@@ -63,6 +75,10 @@ Status BrokerService::Start() {
         return status;
     }
     status = offsets_.Load();
+    if (!status.ok()) {
+        return status;
+    }
+    status = groups_.Start();
     if (!status.ok()) {
         return status;
     }
@@ -120,6 +136,30 @@ ResponseEnvelope BrokerService::Handle(const RequestEnvelope& request) {
             }
             return HandleFetchCommittedOffset(
                 request, std::get<FetchCommittedOffsetRequest>(request.body));
+        case ApiKey::kJoinGroup:
+            if (!std::holds_alternative<JoinGroupRequest>(request.body)) {
+                return MakeError(request, ProtocolErrorCode::kInvalidRequest,
+                                 "join group request envelope has wrong body type");
+            }
+            return HandleJoinGroup(request, std::get<JoinGroupRequest>(request.body));
+        case ApiKey::kSyncGroup:
+            if (!std::holds_alternative<SyncGroupRequest>(request.body)) {
+                return MakeError(request, ProtocolErrorCode::kInvalidRequest,
+                                 "sync group request envelope has wrong body type");
+            }
+            return HandleSyncGroup(request, std::get<SyncGroupRequest>(request.body));
+        case ApiKey::kHeartbeat:
+            if (!std::holds_alternative<HeartbeatRequest>(request.body)) {
+                return MakeError(request, ProtocolErrorCode::kInvalidRequest,
+                                 "heartbeat request envelope has wrong body type");
+            }
+            return HandleHeartbeat(request, std::get<HeartbeatRequest>(request.body));
+        case ApiKey::kLeaveGroup:
+            if (!std::holds_alternative<LeaveGroupRequest>(request.body)) {
+                return MakeError(request, ProtocolErrorCode::kInvalidRequest,
+                                 "leave group request envelope has wrong body type");
+            }
+            return HandleLeaveGroup(request, std::get<LeaveGroupRequest>(request.body));
     }
 
     return MakeError(request, ProtocolErrorCode::kInvalidRequest, "unknown api key");
@@ -136,7 +176,12 @@ Status BrokerService::Close() {
         flusher_condition_.notify_all();
         flusher_.join();
     }
-    return topics_.Close();
+    Status group_status = groups_.Close();
+    Status topics_status = topics_.Close();
+    if (!group_status.ok()) {
+        return group_status;
+    }
+    return topics_status;
 }
 
 ResponseEnvelope BrokerService::HandleProduce(const RequestEnvelope& envelope,
@@ -317,6 +362,63 @@ ResponseEnvelope BrokerService::HandleFetchCommittedOffset(
     return MakeSuccess(envelope,
                        ResponseBody{std::in_place_type<FetchCommittedOffsetResponse>,
                                     std::move(response)});
+}
+
+ResponseEnvelope BrokerService::HandleJoinGroup(const RequestEnvelope& envelope,
+                                                const JoinGroupRequest& request) {
+    auto metadata = topics_.GetMetadata(request.topic);
+    if (!metadata.ok()) {
+        return MakeError(envelope, ProtocolErrorCode::kTopicNotFound,
+                         std::string(metadata.status().message()));
+    }
+    if (metadata.value().empty()) {
+        return MakeError(envelope, ProtocolErrorCode::kTopicNotFound, "topic not found");
+    }
+
+    auto joined = groups_.JoinGroup(request, metadata.value().front().partition_count);
+    if (!joined.ok()) {
+        return MakeError(envelope, GroupErrorCode(joined.status()),
+                         std::string(joined.status().message()));
+    }
+    return MakeSuccess(envelope,
+                       ResponseBody{std::in_place_type<JoinGroupResponse>,
+                                    std::move(joined).value()});
+}
+
+ResponseEnvelope BrokerService::HandleSyncGroup(const RequestEnvelope& envelope,
+                                                const SyncGroupRequest& request) {
+    auto synced = groups_.SyncGroup(request);
+    if (!synced.ok()) {
+        return MakeError(envelope, GroupErrorCode(synced.status()),
+                         std::string(synced.status().message()));
+    }
+    return MakeSuccess(envelope,
+                       ResponseBody{std::in_place_type<SyncGroupResponse>,
+                                    std::move(synced).value()});
+}
+
+ResponseEnvelope BrokerService::HandleHeartbeat(const RequestEnvelope& envelope,
+                                                const HeartbeatRequest& request) {
+    auto heartbeat = groups_.Heartbeat(request);
+    if (!heartbeat.ok()) {
+        return MakeError(envelope, GroupErrorCode(heartbeat.status()),
+                         std::string(heartbeat.status().message()));
+    }
+    return MakeSuccess(envelope,
+                       ResponseBody{std::in_place_type<HeartbeatResponse>,
+                                    std::move(heartbeat).value()});
+}
+
+ResponseEnvelope BrokerService::HandleLeaveGroup(const RequestEnvelope& envelope,
+                                                 const LeaveGroupRequest& request) {
+    auto left = groups_.LeaveGroup(request);
+    if (!left.ok()) {
+        return MakeError(envelope, GroupErrorCode(left.status()),
+                         std::string(left.status().message()));
+    }
+    return MakeSuccess(envelope,
+                       ResponseBody{std::in_place_type<LeaveGroupResponse>,
+                                    std::move(left).value()});
 }
 
 ResponseEnvelope BrokerService::MakeError(const RequestEnvelope& envelope,

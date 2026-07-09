@@ -328,12 +328,65 @@ TEST(NetworkIntegrationTest, ClientSdkProducesPollsAndCommitsOffsets) {
     EXPECT_EQ(records.value()[0].key, "key-a");
     EXPECT_EQ(records.value()[0].value, "value-a");
     EXPECT_TRUE(consumer.CommitSync().ok());
+    EXPECT_TRUE(consumer.Close().ok());
 
     Consumer resumed(ConsumerOptions{options, "group-sdk", 4096});
     ASSERT_TRUE(resumed.Subscribe("sdk").ok());
     auto empty = resumed.Poll(std::chrono::milliseconds(0));
     ASSERT_TRUE(empty.ok()) << empty.status().ToString();
     EXPECT_TRUE(empty.value().empty());
+}
+
+TEST(NetworkIntegrationTest, ClientSdkConsumerGroupSplitsAndReassignsPartitions) {
+    RunningServer server;
+    ClientOptions options;
+    options.host = "127.0.0.1";
+    options.port = server.port();
+
+    AdminClient admin(options);
+    ASSERT_TRUE(admin.CreateTopic("balanced", 4).ok());
+
+    ConsumerOptions consumer_options{options, "group-balanced", 4096,
+                                     std::chrono::milliseconds(10)};
+    Consumer first(consumer_options);
+    Consumer second(consumer_options);
+    ASSERT_TRUE(first.Subscribe("balanced").ok());
+    ASSERT_TRUE(second.Subscribe("balanced").ok());
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    ASSERT_TRUE(first.Poll(std::chrono::milliseconds(0)).ok());
+    ASSERT_TRUE(second.Poll(std::chrono::milliseconds(0)).ok());
+
+    auto first_partitions = first.AssignedPartitions();
+    auto second_partitions = second.AssignedPartitions();
+    EXPECT_EQ(first_partitions, std::vector<PartitionId>({0, 1}));
+    EXPECT_EQ(second_partitions, std::vector<PartitionId>({2, 3}));
+
+    Producer producer(ProducerOptions{options, 1});
+    for (PartitionId partition = 0; partition < 4; ++partition) {
+        auto produced = producer.Send("balanced", "k" + std::to_string(partition),
+                                      "v" + std::to_string(partition), partition);
+        ASSERT_TRUE(produced.ok()) << produced.status().ToString();
+    }
+
+    auto first_records = first.Poll(std::chrono::milliseconds(200));
+    auto second_records = second.Poll(std::chrono::milliseconds(200));
+    ASSERT_TRUE(first_records.ok()) << first_records.status().ToString();
+    ASSERT_TRUE(second_records.ok()) << second_records.status().ToString();
+    ASSERT_EQ(first_records.value().size(), 2U);
+    ASSERT_EQ(second_records.value().size(), 2U);
+    for (const ConsumerRecord& record : first_records.value()) {
+        EXPECT_TRUE(record.partition_id == 0 || record.partition_id == 1);
+    }
+    for (const ConsumerRecord& record : second_records.value()) {
+        EXPECT_TRUE(record.partition_id == 2 || record.partition_id == 3);
+    }
+
+    ASSERT_TRUE(second.Close().ok());
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    ASSERT_TRUE(first.Poll(std::chrono::milliseconds(0)).ok());
+    EXPECT_EQ(first.AssignedPartitions(), std::vector<PartitionId>({0, 1, 2, 3}));
+    EXPECT_TRUE(first.Close().ok());
 }
 
 TEST(NetworkIntegrationTest, ClientSdkReturnsStatusOnConnectionFailure) {

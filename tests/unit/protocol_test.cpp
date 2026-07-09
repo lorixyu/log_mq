@@ -260,6 +260,76 @@ TEST(ProtocolCodecTest, EncodesAndDecodesFetchCommittedOffsetRequest) {
     EXPECT_EQ(fetch.partition_id, 2);
 }
 
+TEST(ProtocolCodecTest, EncodesAndDecodesConsumerGroupRequests) {
+    {
+        RequestEnvelope envelope;
+        envelope.api_key = ApiKey::kJoinGroup;
+        envelope.version = kProtocolVersion;
+        envelope.request_id = 47;
+        envelope.body = JoinGroupRequest{"order-service", "", "orders"};
+
+        auto encoded = EncodeRequest(envelope);
+        ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+        auto decoded = DecodeRequest(AsBytes(encoded.value()));
+        ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+        ASSERT_TRUE(std::holds_alternative<JoinGroupRequest>(decoded.value().body));
+        const auto& join = std::get<JoinGroupRequest>(decoded.value().body);
+        EXPECT_EQ(join.group_id, "order-service");
+        EXPECT_EQ(join.member_id, "");
+        EXPECT_EQ(join.topic, "orders");
+    }
+    {
+        RequestEnvelope envelope;
+        envelope.api_key = ApiKey::kSyncGroup;
+        envelope.version = kProtocolVersion;
+        envelope.request_id = 48;
+        envelope.body = SyncGroupRequest{"order-service", "member-1", 3};
+
+        auto encoded = EncodeRequest(envelope);
+        ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+        auto decoded = DecodeRequest(AsBytes(encoded.value()));
+        ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+        ASSERT_TRUE(std::holds_alternative<SyncGroupRequest>(decoded.value().body));
+        const auto& sync = std::get<SyncGroupRequest>(decoded.value().body);
+        EXPECT_EQ(sync.group_id, "order-service");
+        EXPECT_EQ(sync.member_id, "member-1");
+        EXPECT_EQ(sync.generation_id, 3);
+    }
+    {
+        RequestEnvelope envelope;
+        envelope.api_key = ApiKey::kHeartbeat;
+        envelope.version = kProtocolVersion;
+        envelope.request_id = 49;
+        envelope.body = HeartbeatRequest{"order-service", "member-1", 3};
+
+        auto encoded = EncodeRequest(envelope);
+        ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+        auto decoded = DecodeRequest(AsBytes(encoded.value()));
+        ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+        ASSERT_TRUE(std::holds_alternative<HeartbeatRequest>(decoded.value().body));
+        const auto& heartbeat = std::get<HeartbeatRequest>(decoded.value().body);
+        EXPECT_EQ(heartbeat.group_id, "order-service");
+        EXPECT_EQ(heartbeat.member_id, "member-1");
+        EXPECT_EQ(heartbeat.generation_id, 3);
+    }
+    {
+        RequestEnvelope envelope;
+        envelope.api_key = ApiKey::kLeaveGroup;
+        envelope.version = kProtocolVersion;
+        envelope.request_id = 50;
+        envelope.body = LeaveGroupRequest{"order-service", "member-1"};
+
+        auto encoded = EncodeRequest(envelope);
+        ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+        auto decoded = DecodeRequest(AsBytes(encoded.value()));
+        ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+        ASSERT_TRUE(std::holds_alternative<LeaveGroupRequest>(decoded.value().body));
+        const auto& leave = std::get<LeaveGroupRequest>(decoded.value().body);
+        EXPECT_EQ(leave.group_id, "order-service");
+        EXPECT_EQ(leave.member_id, "member-1");
+    }
+}
+
 TEST(ProtocolCodecTest, EncodesAndDecodesProduceSuccessResponse) {
     ResponseEnvelope response;
     response.api_key = ApiKey::kProduce;
@@ -332,6 +402,80 @@ TEST(ProtocolCodecTest, EncodesAndDecodesFetchCommittedOffsetSuccessResponse) {
         EXPECT_EQ(body.partition_id, 2);
         EXPECT_EQ(body.committed, committed);
         EXPECT_EQ(body.offset, committed ? 43 : 0);
+    }
+}
+
+TEST(ProtocolCodecTest, EncodesAndDecodesConsumerGroupSuccessResponses) {
+    {
+        ResponseEnvelope response;
+        response.api_key = ApiKey::kJoinGroup;
+        response.version = kProtocolVersion;
+        response.request_id = 509;
+        response.error = ErrorResponse{ProtocolErrorCode::kNone, ""};
+        response.body = JoinGroupResponse{"order-service", "member-1", 2, "member-1"};
+
+        auto encoded = EncodeResponse(response);
+        ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+        auto decoded = DecodeResponse(AsBytes(encoded.value()));
+        ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+        ASSERT_TRUE(std::holds_alternative<JoinGroupResponse>(decoded.value().body));
+        const auto& body = std::get<JoinGroupResponse>(decoded.value().body);
+        EXPECT_EQ(body.group_id, "order-service");
+        EXPECT_EQ(body.member_id, "member-1");
+        EXPECT_EQ(body.generation_id, 2);
+        EXPECT_EQ(body.leader_id, "member-1");
+    }
+    {
+        ResponseEnvelope response;
+        response.api_key = ApiKey::kSyncGroup;
+        response.version = kProtocolVersion;
+        response.request_id = 510;
+        response.error = ErrorResponse{ProtocolErrorCode::kNone, ""};
+        response.body = SyncGroupResponse{
+            "order-service", "member-1", 2,
+            PartitionAssignment{"orders", {0, 1, 2}}};
+
+        auto encoded = EncodeResponse(response);
+        ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+        auto decoded = DecodeResponse(AsBytes(encoded.value()));
+        ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+        ASSERT_TRUE(std::holds_alternative<SyncGroupResponse>(decoded.value().body));
+        const auto& body = std::get<SyncGroupResponse>(decoded.value().body);
+        EXPECT_EQ(body.group_id, "order-service");
+        EXPECT_EQ(body.member_id, "member-1");
+        EXPECT_EQ(body.generation_id, 2);
+        EXPECT_EQ(body.assignment.topic, "orders");
+        EXPECT_EQ(body.assignment.partition_ids, std::vector<PartitionId>({0, 1, 2}));
+    }
+    {
+        ResponseEnvelope response;
+        response.api_key = ApiKey::kHeartbeat;
+        response.version = kProtocolVersion;
+        response.request_id = 511;
+        response.error = ErrorResponse{ProtocolErrorCode::kNone, ""};
+        response.body = HeartbeatResponse{"order-service", "member-1", 2};
+
+        auto encoded = EncodeResponse(response);
+        ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+        auto decoded = DecodeResponse(AsBytes(encoded.value()));
+        ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+        ASSERT_TRUE(std::holds_alternative<HeartbeatResponse>(decoded.value().body));
+        EXPECT_EQ(std::get<HeartbeatResponse>(decoded.value().body).generation_id, 2);
+    }
+    {
+        ResponseEnvelope response;
+        response.api_key = ApiKey::kLeaveGroup;
+        response.version = kProtocolVersion;
+        response.request_id = 512;
+        response.error = ErrorResponse{ProtocolErrorCode::kNone, ""};
+        response.body = LeaveGroupResponse{"order-service", "member-1", 3};
+
+        auto encoded = EncodeResponse(response);
+        ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+        auto decoded = DecodeResponse(AsBytes(encoded.value()));
+        ASSERT_TRUE(decoded.ok()) << decoded.status().ToString();
+        ASSERT_TRUE(std::holds_alternative<LeaveGroupResponse>(decoded.value().body));
+        EXPECT_EQ(std::get<LeaveGroupResponse>(decoded.value().body).generation_id, 3);
     }
 }
 

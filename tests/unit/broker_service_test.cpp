@@ -99,11 +99,60 @@ RequestEnvelope MakeFetchCommittedOffset(std::uint64_t request_id,
     return envelope;
 }
 
-BrokerService MakeService(const TempDir& temp_dir) {
+RequestEnvelope MakeJoinGroup(std::uint64_t request_id,
+                              std::string group_id,
+                              std::string member_id,
+                              std::string topic) {
+    RequestEnvelope envelope;
+    envelope.api_key = ApiKey::kJoinGroup;
+    envelope.request_id = request_id;
+    envelope.body =
+        JoinGroupRequest{std::move(group_id), std::move(member_id), std::move(topic)};
+    return envelope;
+}
+
+RequestEnvelope MakeSyncGroup(std::uint64_t request_id,
+                              std::string group_id,
+                              std::string member_id,
+                              std::int32_t generation_id) {
+    RequestEnvelope envelope;
+    envelope.api_key = ApiKey::kSyncGroup;
+    envelope.request_id = request_id;
+    envelope.body =
+        SyncGroupRequest{std::move(group_id), std::move(member_id), generation_id};
+    return envelope;
+}
+
+RequestEnvelope MakeHeartbeat(std::uint64_t request_id,
+                              std::string group_id,
+                              std::string member_id,
+                              std::int32_t generation_id) {
+    RequestEnvelope envelope;
+    envelope.api_key = ApiKey::kHeartbeat;
+    envelope.request_id = request_id;
+    envelope.body =
+        HeartbeatRequest{std::move(group_id), std::move(member_id), generation_id};
+    return envelope;
+}
+
+RequestEnvelope MakeLeaveGroup(std::uint64_t request_id,
+                               std::string group_id,
+                               std::string member_id) {
+    RequestEnvelope envelope;
+    envelope.api_key = ApiKey::kLeaveGroup;
+    envelope.request_id = request_id;
+    envelope.body = LeaveGroupRequest{std::move(group_id), std::move(member_id)};
+    return envelope;
+}
+
+BrokerService MakeService(const TempDir& temp_dir,
+                          std::chrono::milliseconds session_timeout =
+                              std::chrono::milliseconds(10000)) {
     BrokerServiceOptions options;
     options.storage.data_dir = temp_dir.path();
     options.storage.segment_bytes = 1024 * 1024;
     options.storage.flush_policy = FlushPolicy::kAsync;
+    options.consumer.session_timeout = session_timeout;
     return BrokerService(std::move(options));
 }
 
@@ -323,6 +372,140 @@ TEST(BrokerServiceTest, RejectsInvalidConsumerOffsets) {
     EXPECT_EQ(service.Handle(MakeFetchCommittedOffset(8, "bad/group", "orders", 0))
                   .error.error_code,
               ProtocolErrorCode::kInvalidRequest);
+
+    ASSERT_TRUE(service.Close().ok());
+}
+
+TEST(BrokerServiceTest, ConsumerGroupAssignsPartitionsWithRangeAssignor) {
+    TempDir temp_dir;
+    auto service = MakeService(temp_dir);
+    ASSERT_TRUE(service.Start().ok());
+    ASSERT_EQ(service.Handle(MakeCreateTopic(1, "orders", 6)).error.error_code,
+              ProtocolErrorCode::kNone);
+
+    auto join1 = service.Handle(MakeJoinGroup(2, "group-a", "", "orders"));
+    ASSERT_EQ(join1.error.error_code, ProtocolErrorCode::kNone) << join1.error.message;
+    auto join2 = service.Handle(MakeJoinGroup(3, "group-a", "", "orders"));
+    ASSERT_EQ(join2.error.error_code, ProtocolErrorCode::kNone) << join2.error.message;
+    auto join3 = service.Handle(MakeJoinGroup(4, "group-a", "", "orders"));
+    ASSERT_EQ(join3.error.error_code, ProtocolErrorCode::kNone) << join3.error.message;
+
+    const std::string member1 = std::get<JoinGroupResponse>(join1.body).member_id;
+    const std::string member2 = std::get<JoinGroupResponse>(join2.body).member_id;
+    const std::string member3 = std::get<JoinGroupResponse>(join3.body).member_id;
+    EXPECT_EQ(member1, "member-1");
+    EXPECT_EQ(member2, "member-2");
+    EXPECT_EQ(member3, "member-3");
+
+    auto refresh1 = service.Handle(MakeJoinGroup(5, "group-a", member1, "orders"));
+    auto refresh2 = service.Handle(MakeJoinGroup(6, "group-a", member2, "orders"));
+    auto refresh3 = service.Handle(MakeJoinGroup(7, "group-a", member3, "orders"));
+    ASSERT_EQ(refresh1.error.error_code, ProtocolErrorCode::kNone) << refresh1.error.message;
+    ASSERT_EQ(refresh2.error.error_code, ProtocolErrorCode::kNone) << refresh2.error.message;
+    ASSERT_EQ(refresh3.error.error_code, ProtocolErrorCode::kNone) << refresh3.error.message;
+    const auto generation = std::get<JoinGroupResponse>(refresh1.body).generation_id;
+    EXPECT_EQ(std::get<JoinGroupResponse>(refresh2.body).generation_id, generation);
+    EXPECT_EQ(std::get<JoinGroupResponse>(refresh3.body).generation_id, generation);
+
+    auto sync1 = service.Handle(MakeSyncGroup(8, "group-a", member1, generation));
+    auto sync2 = service.Handle(MakeSyncGroup(9, "group-a", member2, generation));
+    auto sync3 = service.Handle(MakeSyncGroup(10, "group-a", member3, generation));
+    ASSERT_EQ(sync1.error.error_code, ProtocolErrorCode::kNone) << sync1.error.message;
+    ASSERT_EQ(sync2.error.error_code, ProtocolErrorCode::kNone) << sync2.error.message;
+    ASSERT_EQ(sync3.error.error_code, ProtocolErrorCode::kNone) << sync3.error.message;
+
+    EXPECT_EQ(std::get<SyncGroupResponse>(sync1.body).assignment.partition_ids,
+              std::vector<PartitionId>({0, 1}));
+    EXPECT_EQ(std::get<SyncGroupResponse>(sync2.body).assignment.partition_ids,
+              std::vector<PartitionId>({2, 3}));
+    EXPECT_EQ(std::get<SyncGroupResponse>(sync3.body).assignment.partition_ids,
+              std::vector<PartitionId>({4, 5}));
+
+    auto leave2 = service.Handle(MakeLeaveGroup(11, "group-a", member2));
+    ASSERT_EQ(leave2.error.error_code, ProtocolErrorCode::kNone) << leave2.error.message;
+    const auto next_generation = std::get<LeaveGroupResponse>(leave2.body).generation_id;
+    auto after_leave1 = service.Handle(MakeSyncGroup(12, "group-a", member1, next_generation));
+    auto after_leave3 = service.Handle(MakeSyncGroup(13, "group-a", member3, next_generation));
+    ASSERT_EQ(after_leave1.error.error_code, ProtocolErrorCode::kNone)
+        << after_leave1.error.message;
+    ASSERT_EQ(after_leave3.error.error_code, ProtocolErrorCode::kNone)
+        << after_leave3.error.message;
+    EXPECT_EQ(std::get<SyncGroupResponse>(after_leave1.body).assignment.partition_ids,
+              std::vector<PartitionId>({0, 1, 2}));
+    EXPECT_EQ(std::get<SyncGroupResponse>(after_leave3.body).assignment.partition_ids,
+              std::vector<PartitionId>({3, 4, 5}));
+
+    ASSERT_TRUE(service.Close().ok());
+}
+
+TEST(BrokerServiceTest, ConsumerGroupRejectsUnknownMembersAndStaleGenerations) {
+    TempDir temp_dir;
+    auto service = MakeService(temp_dir);
+    ASSERT_TRUE(service.Start().ok());
+    ASSERT_EQ(service.Handle(MakeCreateTopic(1, "orders", 2)).error.error_code,
+              ProtocolErrorCode::kNone);
+    ASSERT_EQ(service.Handle(MakeCreateTopic(2, "payments", 1)).error.error_code,
+              ProtocolErrorCode::kNone);
+
+    auto join1 = service.Handle(MakeJoinGroup(3, "group-a", "", "orders"));
+    ASSERT_EQ(join1.error.error_code, ProtocolErrorCode::kNone) << join1.error.message;
+    const auto member1 = std::get<JoinGroupResponse>(join1.body).member_id;
+    const auto generation1 = std::get<JoinGroupResponse>(join1.body).generation_id;
+
+    auto join2 = service.Handle(MakeJoinGroup(4, "group-a", "", "orders"));
+    ASSERT_EQ(join2.error.error_code, ProtocolErrorCode::kNone) << join2.error.message;
+
+    EXPECT_EQ(service.Handle(MakeHeartbeat(5, "group-a", member1, generation1))
+                  .error.error_code,
+              ProtocolErrorCode::kIllegalGeneration);
+    EXPECT_EQ(service.Handle(MakeSyncGroup(6, "group-a", "missing-member", generation1))
+                  .error.error_code,
+              ProtocolErrorCode::kUnknownMember);
+    EXPECT_EQ(service.Handle(MakeJoinGroup(7, "group-a", "", "payments")).error.error_code,
+              ProtocolErrorCode::kInvalidRequest);
+    EXPECT_EQ(service.Handle(MakeJoinGroup(8, "group-a", "bad/member", "orders"))
+                  .error.error_code,
+              ProtocolErrorCode::kInvalidRequest);
+
+    ASSERT_TRUE(service.Close().ok());
+}
+
+TEST(BrokerServiceTest, ConsumerGroupTimesOutMembersAndReassignsPartitions) {
+    TempDir temp_dir;
+    auto service = MakeService(temp_dir, std::chrono::milliseconds(40));
+    ASSERT_TRUE(service.Start().ok());
+    ASSERT_EQ(service.Handle(MakeCreateTopic(1, "orders", 4)).error.error_code,
+              ProtocolErrorCode::kNone);
+
+    auto join1 = service.Handle(MakeJoinGroup(2, "group-a", "", "orders"));
+    auto join2 = service.Handle(MakeJoinGroup(3, "group-a", "", "orders"));
+    ASSERT_EQ(join1.error.error_code, ProtocolErrorCode::kNone) << join1.error.message;
+    ASSERT_EQ(join2.error.error_code, ProtocolErrorCode::kNone) << join2.error.message;
+    const auto member1 = std::get<JoinGroupResponse>(join1.body).member_id;
+    const auto generation = std::get<JoinGroupResponse>(join2.body).generation_id;
+
+    std::int32_t refreshed_generation = 0;
+    for (int attempt = 0; attempt < 80; ++attempt) {
+        auto heartbeat = service.Handle(
+            MakeHeartbeat(static_cast<std::uint64_t>(10 + attempt), "group-a",
+                          member1, generation));
+        if (heartbeat.error.error_code == ProtocolErrorCode::kIllegalGeneration) {
+            auto refreshed = service.Handle(MakeJoinGroup(200, "group-a", member1, "orders"));
+            ASSERT_EQ(refreshed.error.error_code, ProtocolErrorCode::kNone)
+                << refreshed.error.message;
+            refreshed_generation = std::get<JoinGroupResponse>(refreshed.body).generation_id;
+            break;
+        }
+        ASSERT_EQ(heartbeat.error.error_code, ProtocolErrorCode::kNone)
+            << heartbeat.error.message;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_GT(refreshed_generation, generation);
+
+    auto sync = service.Handle(MakeSyncGroup(300, "group-a", member1, refreshed_generation));
+    ASSERT_EQ(sync.error.error_code, ProtocolErrorCode::kNone) << sync.error.message;
+    EXPECT_EQ(std::get<SyncGroupResponse>(sync.body).assignment.partition_ids,
+              std::vector<PartitionId>({0, 1, 2, 3}));
 
     ASSERT_TRUE(service.Close().ok());
 }

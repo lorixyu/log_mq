@@ -18,6 +18,10 @@ enum class ApiKey : std::uint16_t {
     kCreateTopic = 4,
     kCommitOffset = 5,
     kFetchCommittedOffset = 6,
+    kJoinGroup = 7,
+    kSyncGroup = 8,
+    kHeartbeat = 9,
+    kLeaveGroup = 10,
 };
 
 // Protocol-level errors carried by error responses.
@@ -28,6 +32,8 @@ enum class ProtocolErrorCode : std::uint16_t {
     kOffsetOutOfRange = 3,
     kInternal = 4,
     kUnsupportedVersion = 5,
+    kUnknownMember = 6,
+    kIllegalGeneration = 7,
 };
 
 inline constexpr std::uint16_t kProtocolVersion = 1;
@@ -87,6 +93,34 @@ struct FetchCommittedOffsetRequest {
     PartitionId partition_id{kInvalidPartitionId};
 };
 
+struct PartitionAssignment {
+    TopicName topic;
+    std::vector<PartitionId> partition_ids;
+};
+
+struct JoinGroupRequest {
+    std::string group_id;
+    std::string member_id;
+    TopicName topic;
+};
+
+struct SyncGroupRequest {
+    std::string group_id;
+    std::string member_id;
+    std::int32_t generation_id{0};
+};
+
+struct HeartbeatRequest {
+    std::string group_id;
+    std::string member_id;
+    std::int32_t generation_id{0};
+};
+
+struct LeaveGroupRequest {
+    std::string group_id;
+    std::string member_id;
+};
+
 // Decoded request body. RequestEnvelope::api_key must match the active 
 // variant alternative; EncodeRequest validates this before writing bytes.
 using RequestBody = std::variant<ProduceRequest,
@@ -94,7 +128,11 @@ using RequestBody = std::variant<ProduceRequest,
                                  MetadataRequest,
                                  CreateTopicRequest,
                                  CommitOffsetRequest,
-                                 FetchCommittedOffsetRequest>;
+                                 FetchCommittedOffsetRequest,
+                                 JoinGroupRequest,
+                                 SyncGroupRequest,
+                                 HeartbeatRequest,
+                                 LeaveGroupRequest>;
 
 // Complete decoded request frame. request_id is echoed by the response so a
 // client can match responses to in-flight requests on the same connection.
@@ -156,6 +194,32 @@ struct FetchCommittedOffsetResponse {
     Offset offset{0};
 };
 
+struct JoinGroupResponse {
+    std::string group_id;
+    std::string member_id;
+    std::int32_t generation_id{0};
+    std::string leader_id;
+};
+
+struct SyncGroupResponse {
+    std::string group_id;
+    std::string member_id;
+    std::int32_t generation_id{0};
+    PartitionAssignment assignment;
+};
+
+struct HeartbeatResponse {
+    std::string group_id;
+    std::string member_id;
+    std::int32_t generation_id{0};
+};
+
+struct LeaveGroupResponse {
+    std::string group_id;
+    std::string member_id;
+    std::int32_t generation_id{0};
+};
+
 // Successful response payloads are typed by api_key, just like RequestBody.
 // Error responses keep the right empty alternative so callers can still inspect api_key.
 using ResponseBody =
@@ -164,7 +228,11 @@ using ResponseBody =
                  MetadataResponse,
                  CreateTopicResponse,
                  CommitOffsetResponse,
-                 FetchCommittedOffsetResponse>;
+                 FetchCommittedOffsetResponse,
+                 JoinGroupResponse,
+                 SyncGroupResponse,
+                 HeartbeatResponse,
+                 LeaveGroupResponse>;
 
 // Wire body layout is: error_code + message + optional success payload.
 // The success payload is present only when error_code == kNone.

@@ -117,6 +117,14 @@ Result<ApiKey> ParseApiKey(std::uint16_t value) {
             return ApiKey::kCommitOffset;
         case static_cast<std::uint16_t>(ApiKey::kFetchCommittedOffset):
             return ApiKey::kFetchCommittedOffset;
+        case static_cast<std::uint16_t>(ApiKey::kJoinGroup):
+            return ApiKey::kJoinGroup;
+        case static_cast<std::uint16_t>(ApiKey::kSyncGroup):
+            return ApiKey::kSyncGroup;
+        case static_cast<std::uint16_t>(ApiKey::kHeartbeat):
+            return ApiKey::kHeartbeat;
+        case static_cast<std::uint16_t>(ApiKey::kLeaveGroup):
+            return ApiKey::kLeaveGroup;
     }
     return Status::InvalidArgument("unknown api key");
 }
@@ -135,6 +143,10 @@ Result<ProtocolErrorCode> ParseProtocolErrorCode(std::uint16_t value) {
             return ProtocolErrorCode::kInternal;
         case static_cast<std::uint16_t>(ProtocolErrorCode::kUnsupportedVersion):
             return ProtocolErrorCode::kUnsupportedVersion;
+        case static_cast<std::uint16_t>(ProtocolErrorCode::kUnknownMember):
+            return ProtocolErrorCode::kUnknownMember;
+        case static_cast<std::uint16_t>(ProtocolErrorCode::kIllegalGeneration):
+            return ProtocolErrorCode::kIllegalGeneration;
     }
     return Status::InvalidArgument("unknown protocol error code");
 }
@@ -150,6 +162,21 @@ PartitionId DecodePartitionId(std::uint32_t value) {
     const auto signed_value = static_cast<std::int64_t>(value) -
                               (static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max()) + 1);
     return static_cast<PartitionId>(signed_value);
+}
+
+Status AppendGenerationId(std::int32_t generation_id, std::vector<std::byte>& output) {
+    if (generation_id < 0) {
+        return Status::InvalidArgument("generation_id must not be negative");
+    }
+    AppendBigEndian<std::uint32_t>(static_cast<std::uint32_t>(generation_id), output);
+    return Status::Ok();
+}
+
+Result<std::int32_t> DecodeGenerationId(std::uint32_t value) {
+    if (value > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
+        return Status::InvalidArgument("generation_id is too large");
+    }
+    return static_cast<std::int32_t>(value);
 }
 
 Status ValidateFrame(std::span<const std::byte> frame) {
@@ -266,6 +293,70 @@ Result<std::vector<std::byte>> EncodeFetchCommittedOffsetBody(
         return status;
     }
     AppendPartitionId(request.partition_id, body);
+    return body;
+}
+
+Result<std::vector<std::byte>> EncodeJoinGroupBody(const JoinGroupRequest& request) {
+    std::vector<std::byte> body;
+    Status status = AppendString(request.group_id, body);
+    if (!status.ok()) {
+        return status;
+    }
+    status = AppendString(request.member_id, body);
+    if (!status.ok()) {
+        return status;
+    }
+    status = AppendString(request.topic, body);
+    if (!status.ok()) {
+        return status;
+    }
+    return body;
+}
+
+Result<std::vector<std::byte>> EncodeSyncGroupBody(const SyncGroupRequest& request) {
+    std::vector<std::byte> body;
+    Status status = AppendString(request.group_id, body);
+    if (!status.ok()) {
+        return status;
+    }
+    status = AppendString(request.member_id, body);
+    if (!status.ok()) {
+        return status;
+    }
+    status = AppendGenerationId(request.generation_id, body);
+    if (!status.ok()) {
+        return status;
+    }
+    return body;
+}
+
+Result<std::vector<std::byte>> EncodeHeartbeatBody(const HeartbeatRequest& request) {
+    std::vector<std::byte> body;
+    Status status = AppendString(request.group_id, body);
+    if (!status.ok()) {
+        return status;
+    }
+    status = AppendString(request.member_id, body);
+    if (!status.ok()) {
+        return status;
+    }
+    status = AppendGenerationId(request.generation_id, body);
+    if (!status.ok()) {
+        return status;
+    }
+    return body;
+}
+
+Result<std::vector<std::byte>> EncodeLeaveGroupBody(const LeaveGroupRequest& request) {
+    std::vector<std::byte> body;
+    Status status = AppendString(request.group_id, body);
+    if (!status.ok()) {
+        return status;
+    }
+    status = AppendString(request.member_id, body);
+    if (!status.ok()) {
+        return status;
+    }
     return body;
 }
 
@@ -458,6 +549,109 @@ Result<FetchCommittedOffsetRequest> DecodeFetchCommittedOffsetBody(
     return request;
 }
 
+Result<JoinGroupRequest> DecodeJoinGroupBody(std::span<const std::byte> body) {
+    BodyReader reader(body);
+    auto group_id = reader.ReadString();
+    if (!group_id.ok()) {
+        return group_id.status();
+    }
+    auto member_id = reader.ReadString();
+    if (!member_id.ok()) {
+        return member_id.status();
+    }
+    auto topic = reader.ReadString();
+    if (!topic.ok()) {
+        return topic.status();
+    }
+    if (!reader.consumed()) {
+        return Status::InvalidArgument("join group request has trailing bytes");
+    }
+
+    JoinGroupRequest request;
+    request.group_id = std::move(group_id).value();
+    request.member_id = std::move(member_id).value();
+    request.topic = std::move(topic).value();
+    return request;
+}
+
+Result<SyncGroupRequest> DecodeSyncGroupBody(std::span<const std::byte> body) {
+    BodyReader reader(body);
+    auto group_id = reader.ReadString();
+    if (!group_id.ok()) {
+        return group_id.status();
+    }
+    auto member_id = reader.ReadString();
+    if (!member_id.ok()) {
+        return member_id.status();
+    }
+    auto generation = reader.ReadUInt<std::uint32_t>();
+    if (!generation.ok()) {
+        return generation.status();
+    }
+    auto generation_id = DecodeGenerationId(generation.value());
+    if (!generation_id.ok()) {
+        return generation_id.status();
+    }
+    if (!reader.consumed()) {
+        return Status::InvalidArgument("sync group request has trailing bytes");
+    }
+
+    SyncGroupRequest request;
+    request.group_id = std::move(group_id).value();
+    request.member_id = std::move(member_id).value();
+    request.generation_id = generation_id.value();
+    return request;
+}
+
+Result<HeartbeatRequest> DecodeHeartbeatBody(std::span<const std::byte> body) {
+    BodyReader reader(body);
+    auto group_id = reader.ReadString();
+    if (!group_id.ok()) {
+        return group_id.status();
+    }
+    auto member_id = reader.ReadString();
+    if (!member_id.ok()) {
+        return member_id.status();
+    }
+    auto generation = reader.ReadUInt<std::uint32_t>();
+    if (!generation.ok()) {
+        return generation.status();
+    }
+    auto generation_id = DecodeGenerationId(generation.value());
+    if (!generation_id.ok()) {
+        return generation_id.status();
+    }
+    if (!reader.consumed()) {
+        return Status::InvalidArgument("heartbeat request has trailing bytes");
+    }
+
+    HeartbeatRequest request;
+    request.group_id = std::move(group_id).value();
+    request.member_id = std::move(member_id).value();
+    request.generation_id = generation_id.value();
+    return request;
+}
+
+Result<LeaveGroupRequest> DecodeLeaveGroupBody(std::span<const std::byte> body) {
+    BodyReader reader(body);
+    auto group_id = reader.ReadString();
+    if (!group_id.ok()) {
+        return group_id.status();
+    }
+    auto member_id = reader.ReadString();
+    if (!member_id.ok()) {
+        return member_id.status();
+    }
+    if (!reader.consumed()) {
+        return Status::InvalidArgument("leave group request has trailing bytes");
+    }
+
+    LeaveGroupRequest request;
+    request.group_id = std::move(group_id).value();
+    request.member_id = std::move(member_id).value();
+    return request;
+}
+
 Result<std::vector<std::byte>> EncodeRequestBody(const RequestEnvelope& request) {
     switch (request.api_key) {
         case ApiKey::kProduce:
@@ -492,6 +686,26 @@ Result<std::vector<std::byte>> EncodeRequestBody(const RequestEnvelope& request)
             }
             return EncodeFetchCommittedOffsetBody(
                 std::get<FetchCommittedOffsetRequest>(request.body));
+        case ApiKey::kJoinGroup:
+            if (!std::holds_alternative<JoinGroupRequest>(request.body)) {
+                return Status::InvalidArgument("join group request envelope has wrong body type");
+            }
+            return EncodeJoinGroupBody(std::get<JoinGroupRequest>(request.body));
+        case ApiKey::kSyncGroup:
+            if (!std::holds_alternative<SyncGroupRequest>(request.body)) {
+                return Status::InvalidArgument("sync group request envelope has wrong body type");
+            }
+            return EncodeSyncGroupBody(std::get<SyncGroupRequest>(request.body));
+        case ApiKey::kHeartbeat:
+            if (!std::holds_alternative<HeartbeatRequest>(request.body)) {
+                return Status::InvalidArgument("heartbeat request envelope has wrong body type");
+            }
+            return EncodeHeartbeatBody(std::get<HeartbeatRequest>(request.body));
+        case ApiKey::kLeaveGroup:
+            if (!std::holds_alternative<LeaveGroupRequest>(request.body)) {
+                return Status::InvalidArgument("leave group request envelope has wrong body type");
+            }
+            return EncodeLeaveGroupBody(std::get<LeaveGroupRequest>(request.body));
     }
     return Status::InvalidArgument("unknown api key");
 }
@@ -611,6 +825,107 @@ Result<std::vector<std::byte>> EncodeFetchCommittedOffsetResponseBody(
     return body;
 }
 
+Status AppendPartitionAssignment(const PartitionAssignment& assignment,
+                                 std::vector<std::byte>& body) {
+    if (assignment.partition_ids.size() > std::numeric_limits<std::uint32_t>::max()) {
+        return Status::InvalidArgument("assignment contains too many partitions");
+    }
+
+    Status status = AppendString(assignment.topic, body);
+    if (!status.ok()) {
+        return status;
+    }
+    AppendBigEndian<std::uint32_t>(
+        static_cast<std::uint32_t>(assignment.partition_ids.size()), body);
+    for (PartitionId partition_id : assignment.partition_ids) {
+        if (partition_id < 0) {
+            return Status::InvalidArgument("assignment partition_id must not be negative");
+        }
+        AppendPartitionId(partition_id, body);
+    }
+    return Status::Ok();
+}
+
+Result<std::vector<std::byte>> EncodeJoinGroupResponseBody(
+    const JoinGroupResponse& response) {
+    std::vector<std::byte> body;
+    Status status = AppendString(response.group_id, body);
+    if (!status.ok()) {
+        return status;
+    }
+    status = AppendString(response.member_id, body);
+    if (!status.ok()) {
+        return status;
+    }
+    status = AppendGenerationId(response.generation_id, body);
+    if (!status.ok()) {
+        return status;
+    }
+    status = AppendString(response.leader_id, body);
+    if (!status.ok()) {
+        return status;
+    }
+    return body;
+}
+
+Result<std::vector<std::byte>> EncodeSyncGroupResponseBody(
+    const SyncGroupResponse& response) {
+    std::vector<std::byte> body;
+    Status status = AppendString(response.group_id, body);
+    if (!status.ok()) {
+        return status;
+    }
+    status = AppendString(response.member_id, body);
+    if (!status.ok()) {
+        return status;
+    }
+    status = AppendGenerationId(response.generation_id, body);
+    if (!status.ok()) {
+        return status;
+    }
+    status = AppendPartitionAssignment(response.assignment, body);
+    if (!status.ok()) {
+        return status;
+    }
+    return body;
+}
+
+Result<std::vector<std::byte>> EncodeHeartbeatResponseBody(
+    const HeartbeatResponse& response) {
+    std::vector<std::byte> body;
+    Status status = AppendString(response.group_id, body);
+    if (!status.ok()) {
+        return status;
+    }
+    status = AppendString(response.member_id, body);
+    if (!status.ok()) {
+        return status;
+    }
+    status = AppendGenerationId(response.generation_id, body);
+    if (!status.ok()) {
+        return status;
+    }
+    return body;
+}
+
+Result<std::vector<std::byte>> EncodeLeaveGroupResponseBody(
+    const LeaveGroupResponse& response) {
+    std::vector<std::byte> body;
+    Status status = AppendString(response.group_id, body);
+    if (!status.ok()) {
+        return status;
+    }
+    status = AppendString(response.member_id, body);
+    if (!status.ok()) {
+        return status;
+    }
+    status = AppendGenerationId(response.generation_id, body);
+    if (!status.ok()) {
+        return status;
+    }
+    return body;
+}
+
 Result<std::vector<std::byte>> EncodeResponseBody(const ResponseEnvelope& response) {
     // The api_key selects the response schema. This keeps callers from sending
     // a MetadataResponse inside a Produce frame by mistake.
@@ -647,6 +962,26 @@ Result<std::vector<std::byte>> EncodeResponseBody(const ResponseEnvelope& respon
             }
             return EncodeFetchCommittedOffsetResponseBody(
                 std::get<FetchCommittedOffsetResponse>(response.body));
+        case ApiKey::kJoinGroup:
+            if (!std::holds_alternative<JoinGroupResponse>(response.body)) {
+                return Status::InvalidArgument("join group response envelope has wrong body type");
+            }
+            return EncodeJoinGroupResponseBody(std::get<JoinGroupResponse>(response.body));
+        case ApiKey::kSyncGroup:
+            if (!std::holds_alternative<SyncGroupResponse>(response.body)) {
+                return Status::InvalidArgument("sync group response envelope has wrong body type");
+            }
+            return EncodeSyncGroupResponseBody(std::get<SyncGroupResponse>(response.body));
+        case ApiKey::kHeartbeat:
+            if (!std::holds_alternative<HeartbeatResponse>(response.body)) {
+                return Status::InvalidArgument("heartbeat response envelope has wrong body type");
+            }
+            return EncodeHeartbeatResponseBody(std::get<HeartbeatResponse>(response.body));
+        case ApiKey::kLeaveGroup:
+            if (!std::holds_alternative<LeaveGroupResponse>(response.body)) {
+                return Status::InvalidArgument("leave group response envelope has wrong body type");
+            }
+            return EncodeLeaveGroupResponseBody(std::get<LeaveGroupResponse>(response.body));
     }
     return Status::InvalidArgument("unknown api key");
 }
@@ -667,6 +1002,14 @@ ResponseBody EmptyResponseBodyFor(ApiKey api_key) {
             return ResponseBody{std::in_place_type<CommitOffsetResponse>};
         case ApiKey::kFetchCommittedOffset:
             return ResponseBody{std::in_place_type<FetchCommittedOffsetResponse>};
+        case ApiKey::kJoinGroup:
+            return ResponseBody{std::in_place_type<JoinGroupResponse>};
+        case ApiKey::kSyncGroup:
+            return ResponseBody{std::in_place_type<SyncGroupResponse>};
+        case ApiKey::kHeartbeat:
+            return ResponseBody{std::in_place_type<HeartbeatResponse>};
+        case ApiKey::kLeaveGroup:
+            return ResponseBody{std::in_place_type<LeaveGroupResponse>};
     }
     return ResponseBody{std::in_place_type<ProduceResponse>};
 }
@@ -819,6 +1162,143 @@ Result<FetchCommittedOffsetResponse> DecodeFetchCommittedOffsetResponseBody(
     return response;
 }
 
+Result<PartitionAssignment> DecodePartitionAssignment(BodyReader& reader) {
+    auto topic = reader.ReadString();
+    if (!topic.ok()) {
+        return topic.status();
+    }
+    auto partition_count = reader.ReadUInt<std::uint32_t>();
+    if (!partition_count.ok()) {
+        return partition_count.status();
+    }
+
+    PartitionAssignment assignment;
+    assignment.topic = std::move(topic).value();
+    assignment.partition_ids.reserve(partition_count.value());
+    for (std::uint32_t i = 0; i < partition_count.value(); ++i) {
+        auto partition = reader.ReadUInt<std::uint32_t>();
+        if (!partition.ok()) {
+            return partition.status();
+        }
+        const PartitionId partition_id = DecodePartitionId(partition.value());
+        if (partition_id < 0) {
+            return Status::InvalidArgument("assignment partition_id must not be negative");
+        }
+        assignment.partition_ids.push_back(partition_id);
+    }
+    return assignment;
+}
+
+Result<JoinGroupResponse> DecodeJoinGroupResponseBody(BodyReader& reader) {
+    auto group_id = reader.ReadString();
+    if (!group_id.ok()) {
+        return group_id.status();
+    }
+    auto member_id = reader.ReadString();
+    if (!member_id.ok()) {
+        return member_id.status();
+    }
+    auto generation = reader.ReadUInt<std::uint32_t>();
+    if (!generation.ok()) {
+        return generation.status();
+    }
+    auto generation_id = DecodeGenerationId(generation.value());
+    if (!generation_id.ok()) {
+        return generation_id.status();
+    }
+    auto leader_id = reader.ReadString();
+    if (!leader_id.ok()) {
+        return leader_id.status();
+    }
+
+    JoinGroupResponse response;
+    response.group_id = std::move(group_id).value();
+    response.member_id = std::move(member_id).value();
+    response.generation_id = generation_id.value();
+    response.leader_id = std::move(leader_id).value();
+    return response;
+}
+
+Result<SyncGroupResponse> DecodeSyncGroupResponseBody(BodyReader& reader) {
+    auto group_id = reader.ReadString();
+    if (!group_id.ok()) {
+        return group_id.status();
+    }
+    auto member_id = reader.ReadString();
+    if (!member_id.ok()) {
+        return member_id.status();
+    }
+    auto generation = reader.ReadUInt<std::uint32_t>();
+    if (!generation.ok()) {
+        return generation.status();
+    }
+    auto generation_id = DecodeGenerationId(generation.value());
+    if (!generation_id.ok()) {
+        return generation_id.status();
+    }
+    auto assignment = DecodePartitionAssignment(reader);
+    if (!assignment.ok()) {
+        return assignment.status();
+    }
+
+    SyncGroupResponse response;
+    response.group_id = std::move(group_id).value();
+    response.member_id = std::move(member_id).value();
+    response.generation_id = generation_id.value();
+    response.assignment = std::move(assignment).value();
+    return response;
+}
+
+Result<HeartbeatResponse> DecodeHeartbeatResponseBody(BodyReader& reader) {
+    auto group_id = reader.ReadString();
+    if (!group_id.ok()) {
+        return group_id.status();
+    }
+    auto member_id = reader.ReadString();
+    if (!member_id.ok()) {
+        return member_id.status();
+    }
+    auto generation = reader.ReadUInt<std::uint32_t>();
+    if (!generation.ok()) {
+        return generation.status();
+    }
+    auto generation_id = DecodeGenerationId(generation.value());
+    if (!generation_id.ok()) {
+        return generation_id.status();
+    }
+
+    HeartbeatResponse response;
+    response.group_id = std::move(group_id).value();
+    response.member_id = std::move(member_id).value();
+    response.generation_id = generation_id.value();
+    return response;
+}
+
+Result<LeaveGroupResponse> DecodeLeaveGroupResponseBody(BodyReader& reader) {
+    auto group_id = reader.ReadString();
+    if (!group_id.ok()) {
+        return group_id.status();
+    }
+    auto member_id = reader.ReadString();
+    if (!member_id.ok()) {
+        return member_id.status();
+    }
+    auto generation = reader.ReadUInt<std::uint32_t>();
+    if (!generation.ok()) {
+        return generation.status();
+    }
+    auto generation_id = DecodeGenerationId(generation.value());
+    if (!generation_id.ok()) {
+        return generation_id.status();
+    }
+
+    LeaveGroupResponse response;
+    response.group_id = std::move(group_id).value();
+    response.member_id = std::move(member_id).value();
+    response.generation_id = generation_id.value();
+    return response;
+}
+
 Result<ResponseBody> DecodeResponseBody(ApiKey api_key, BodyReader& reader) {
     switch (api_key) {
         case ApiKey::kProduce: {
@@ -863,6 +1343,38 @@ Result<ResponseBody> DecodeResponseBody(ApiKey api_key, BodyReader& reader) {
                 return response.status();
             }
             return ResponseBody{std::in_place_type<FetchCommittedOffsetResponse>,
+                                std::move(response).value()};
+        }
+        case ApiKey::kJoinGroup: {
+            auto response = DecodeJoinGroupResponseBody(reader);
+            if (!response.ok()) {
+                return response.status();
+            }
+            return ResponseBody{std::in_place_type<JoinGroupResponse>,
+                                std::move(response).value()};
+        }
+        case ApiKey::kSyncGroup: {
+            auto response = DecodeSyncGroupResponseBody(reader);
+            if (!response.ok()) {
+                return response.status();
+            }
+            return ResponseBody{std::in_place_type<SyncGroupResponse>,
+                                std::move(response).value()};
+        }
+        case ApiKey::kHeartbeat: {
+            auto response = DecodeHeartbeatResponseBody(reader);
+            if (!response.ok()) {
+                return response.status();
+            }
+            return ResponseBody{std::in_place_type<HeartbeatResponse>,
+                                std::move(response).value()};
+        }
+        case ApiKey::kLeaveGroup: {
+            auto response = DecodeLeaveGroupResponseBody(reader);
+            if (!response.ok()) {
+                return response.status();
+            }
+            return ResponseBody{std::in_place_type<LeaveGroupResponse>,
                                 std::move(response).value()};
         }
     }
@@ -916,6 +1428,38 @@ Result<RequestBody> DecodeRequestBody(ApiKey api_key, std::span<const std::byte>
             return RequestBody{std::in_place_type<FetchCommittedOffsetRequest>,
                                std::move(request).value()};
         }
+        case ApiKey::kJoinGroup: {
+            auto request = DecodeJoinGroupBody(body);
+            if (!request.ok()) {
+                return request.status();
+            }
+            return RequestBody{std::in_place_type<JoinGroupRequest>,
+                               std::move(request).value()};
+        }
+        case ApiKey::kSyncGroup: {
+            auto request = DecodeSyncGroupBody(body);
+            if (!request.ok()) {
+                return request.status();
+            }
+            return RequestBody{std::in_place_type<SyncGroupRequest>,
+                               std::move(request).value()};
+        }
+        case ApiKey::kHeartbeat: {
+            auto request = DecodeHeartbeatBody(body);
+            if (!request.ok()) {
+                return request.status();
+            }
+            return RequestBody{std::in_place_type<HeartbeatRequest>,
+                               std::move(request).value()};
+        }
+        case ApiKey::kLeaveGroup: {
+            auto request = DecodeLeaveGroupBody(body);
+            if (!request.ok()) {
+                return request.status();
+            }
+            return RequestBody{std::in_place_type<LeaveGroupRequest>,
+                               std::move(request).value()};
+        }
     }
     return Status::InvalidArgument("unknown api key");
 }
@@ -943,6 +1487,14 @@ std::string_view ApiKeyName(ApiKey api_key) {
             return "CommitOffset";
         case ApiKey::kFetchCommittedOffset:
             return "FetchCommittedOffset";
+        case ApiKey::kJoinGroup:
+            return "JoinGroup";
+        case ApiKey::kSyncGroup:
+            return "SyncGroup";
+        case ApiKey::kHeartbeat:
+            return "Heartbeat";
+        case ApiKey::kLeaveGroup:
+            return "LeaveGroup";
     }
     return "Unknown";
 }
@@ -961,6 +1513,10 @@ std::string_view ProtocolErrorCodeName(ProtocolErrorCode code) {
             return "Internal";
         case ProtocolErrorCode::kUnsupportedVersion:
             return "UnsupportedVersion";
+        case ProtocolErrorCode::kUnknownMember:
+            return "UnknownMember";
+        case ProtocolErrorCode::kIllegalGeneration:
+            return "IllegalGeneration";
     }
     return "Unknown";
 }

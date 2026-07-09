@@ -26,7 +26,11 @@ void PrintUsage() {
               << "  produce --topic TOPIC [--partition N] --key KEY --value VALUE [--timestamp TS]\n"
               << "  fetch --topic TOPIC --partition N --offset OFFSET [--max-bytes N]\n"
               << "  commit-offset --group GROUP --topic TOPIC --partition N --offset N\n"
-              << "  fetch-offset --group GROUP --topic TOPIC --partition N\n";
+              << "  fetch-offset --group GROUP --topic TOPIC --partition N\n"
+              << "  join-group --group GROUP --topic TOPIC [--member MEMBER]\n"
+              << "  sync-group --group GROUP --member MEMBER --generation N\n"
+              << "  heartbeat --group GROUP --member MEMBER --generation N\n"
+              << "  leave-group --group GROUP --member MEMBER\n";
 }
 
 std::string ReadArg(int& index, int argc, char** argv) {
@@ -157,6 +161,39 @@ logmq::RequestEnvelope BuildRequest(int argc, char** argv, const CliOptions& opt
         envelope.body =
             logmq::RequestBody{std::in_place_type<logmq::FetchCommittedOffsetRequest>,
                                std::move(request)};
+    } else if (options.command == "join-group") {
+        envelope.api_key = logmq::ApiKey::kJoinGroup;
+        logmq::JoinGroupRequest request;
+        request.group_id = RequiredOption(argc, argv, options.command_index, "--group");
+        request.topic = RequiredOption(argc, argv, options.command_index, "--topic");
+        request.member_id = OptionValue(argc, argv, options.command_index, "--member");
+        envelope.body = logmq::RequestBody{std::in_place_type<logmq::JoinGroupRequest>,
+                                           std::move(request)};
+    } else if (options.command == "sync-group") {
+        envelope.api_key = logmq::ApiKey::kSyncGroup;
+        logmq::SyncGroupRequest request;
+        request.group_id = RequiredOption(argc, argv, options.command_index, "--group");
+        request.member_id = RequiredOption(argc, argv, options.command_index, "--member");
+        request.generation_id = static_cast<std::int32_t>(
+            std::stoi(RequiredOption(argc, argv, options.command_index, "--generation")));
+        envelope.body = logmq::RequestBody{std::in_place_type<logmq::SyncGroupRequest>,
+                                           std::move(request)};
+    } else if (options.command == "heartbeat") {
+        envelope.api_key = logmq::ApiKey::kHeartbeat;
+        logmq::HeartbeatRequest request;
+        request.group_id = RequiredOption(argc, argv, options.command_index, "--group");
+        request.member_id = RequiredOption(argc, argv, options.command_index, "--member");
+        request.generation_id = static_cast<std::int32_t>(
+            std::stoi(RequiredOption(argc, argv, options.command_index, "--generation")));
+        envelope.body = logmq::RequestBody{std::in_place_type<logmq::HeartbeatRequest>,
+                                           std::move(request)};
+    } else if (options.command == "leave-group") {
+        envelope.api_key = logmq::ApiKey::kLeaveGroup;
+        logmq::LeaveGroupRequest request;
+        request.group_id = RequiredOption(argc, argv, options.command_index, "--group");
+        request.member_id = RequiredOption(argc, argv, options.command_index, "--member");
+        envelope.body = logmq::RequestBody{std::in_place_type<logmq::LeaveGroupRequest>,
+                                           std::move(request)};
     } else {
         throw std::runtime_error("unknown command: " + options.command);
     }
@@ -217,6 +254,39 @@ int PrintResponse(const logmq::ResponseEnvelope& response) {
                       << " partition=" << body.partition_id
                       << " committed=" << (body.committed ? "true" : "false")
                       << " offset=" << body.offset << "\n";
+            return 0;
+        }
+        case logmq::ApiKey::kJoinGroup: {
+            const auto& body = std::get<logmq::JoinGroupResponse>(response.body);
+            std::cout << "group=" << body.group_id << " member=" << body.member_id
+                      << " generation=" << body.generation_id
+                      << " leader=" << body.leader_id << "\n";
+            return 0;
+        }
+        case logmq::ApiKey::kSyncGroup: {
+            const auto& body = std::get<logmq::SyncGroupResponse>(response.body);
+            std::cout << "group=" << body.group_id << " member=" << body.member_id
+                      << " generation=" << body.generation_id
+                      << " topic=" << body.assignment.topic << " partitions=";
+            for (std::size_t i = 0; i < body.assignment.partition_ids.size(); ++i) {
+                if (i != 0) {
+                    std::cout << ",";
+                }
+                std::cout << body.assignment.partition_ids[i];
+            }
+            std::cout << "\n";
+            return 0;
+        }
+        case logmq::ApiKey::kHeartbeat: {
+            const auto& body = std::get<logmq::HeartbeatResponse>(response.body);
+            std::cout << "group=" << body.group_id << " member=" << body.member_id
+                      << " generation=" << body.generation_id << "\n";
+            return 0;
+        }
+        case logmq::ApiKey::kLeaveGroup: {
+            const auto& body = std::get<logmq::LeaveGroupResponse>(response.body);
+            std::cout << "group=" << body.group_id << " member=" << body.member_id
+                      << " generation=" << body.generation_id << "\n";
             return 0;
         }
     }
