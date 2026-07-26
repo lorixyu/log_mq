@@ -58,6 +58,7 @@ int File::fd() const { return fd_; }
 
 const std::filesystem::path& File::path() const { return path_; }
 
+// 读取 buffer 个大小，从offset开始。放入 data 中。
 Result<std::size_t> File::PRead(std::span<std::byte> data, std::uint64_t offset) const {
     if (!is_open()) {
         return Status::InvalidArgument("pread on closed file");

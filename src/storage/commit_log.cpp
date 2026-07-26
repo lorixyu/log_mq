@@ -33,6 +33,7 @@ bool ParseBaseOffset(const std::filesystem::path& path, Offset& offset) {
     return true;
 }
 
+// 判断该 batch 是否包含该 offset
 bool BatchContainsOffset(const RecordBatch& batch, Offset offset) {
     if (batch.base_offset < 0) {
         return false;
@@ -97,6 +98,7 @@ Result<CommitLog> CommitLog::Open(CommitLogOptions options) {
     return std::move(log);
 }
 
+// 将消息 append 到当前partition 末尾的 segment，已满则新建 segment 文件 
 Result<AppendResult> CommitLog::Append(std::vector<Record> records) {
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -139,6 +141,7 @@ Result<AppendResult> CommitLog::Append(std::vector<Record> records) {
     }
 
     next_offset_ += static_cast<Offset>(batch.value().record_count);
+    // 返回的 offset 是该 batch 的起始字节
     return AppendResult{batch.value().base_offset, position.value(), target.path()};
 }
 
@@ -155,6 +158,7 @@ Result<RecordBatch> CommitLog::Read(Offset offset, std::size_t max_bytes) const 
         return Status::NotFound("commit log offset is not readable");
     }
 
+    // 找到含有该 offset 的 .log 文件, 返回下标
     auto segment_index = FindSegmentIndex(offset);
     if (!segment_index.ok()) {
         return segment_index.status();
@@ -332,6 +336,7 @@ Result<CommitLog::RecoveryResult> CommitLog::RecoverSegment(Segment& segment,
     return RecoveryResult{recovered_next_offset};
 }
 
+// 找到含有该 offset 的 segment 在 segments_ 的下标
 Result<std::size_t> CommitLog::FindSegmentIndex(Offset offset) const {
     if (segments_.empty()) {
         return Status::NotFound("commit log has no segments");
@@ -348,6 +353,7 @@ Result<std::size_t> CommitLog::FindSegmentIndex(Offset offset) const {
     return static_cast<std::size_t>((it - 1) - segments_.begin());
 }
 
+// 打开或创建一个新的 segment
 Status CommitLog::RollSegment(Offset base_offset) {
     auto segment = Segment::Open(SegmentPath(base_offset), base_offset);
     if (!segment.ok()) {
@@ -356,6 +362,7 @@ Status CommitLog::RollSegment(Offset base_offset) {
 
     segments_.push_back(std::move(segment).value());
     indexes_.emplace_back(IndexPath(base_offset), base_offset, options_.index_interval_bytes);
+    // 创建一个新的 .index 文件
     return indexes_.back().Rewrite();
 }
 

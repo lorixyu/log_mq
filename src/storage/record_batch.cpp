@@ -58,6 +58,7 @@ Result<std::vector<std::byte>> EncodeRecordsPayload(const std::vector<Record>& r
 
 }  // namespace
 
+// 将 records 根据base_offset封装为Batch
 Result<RecordBatch> MakeRecordBatch(Offset base_offset, std::vector<Record> records) {
     if (base_offset < 0) {
         return Status::InvalidArgument("record batch base_offset must not be negative");
@@ -186,7 +187,7 @@ Result<RecordBatch> DecodeRecordBatch(std::span<const std::byte> data) {
 
     std::size_t consumed = 0;
     for (std::uint64_t i = 0; i < record_count.value(); ++i) {
-        auto decoded = DecodeRecord(payload.subspan(consumed));
+        auto decoded = DecodeRecord(payload.subspan(consumed));  // DecodeRecord内部会找到一条Record的边界。
         if (!decoded.ok()) {
             return decoded.status();
         }

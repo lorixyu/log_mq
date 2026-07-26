@@ -13,7 +13,7 @@ namespace logmq {
 
 // A batch of records. 
 struct RecordBatch {
-    Offset base_offset{kInvalidOffset};
+    Offset base_offset{kInvalidOffset};  // 属于单个 partition 的逻辑消息offset
     std::uint64_t record_count{0};
     std::uint64_t batch_bytes{0};
     std::uint32_t batch_crc32{0};

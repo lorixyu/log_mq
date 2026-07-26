@@ -13,3 +13,18 @@ data/
 docs/
 
 .vscode
+# 忽略 Vim / Neovim 生成的交换文件
+*.swp
+*.swo
+.*.swp
+
+# 忽略临时/哈希后缀文件
+*.[0-9a-fA-F]*
+*.tmp
+
+# C/C++ 常见的编译与 IDE 忽略项
+*.o
+*.obj
+build/
+.vscode/
+.idea/

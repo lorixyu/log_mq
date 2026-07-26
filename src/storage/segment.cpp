@@ -49,6 +49,8 @@ Result<std::uint64_t> Segment::Append(const RecordBatch& batch) {
     }
 
     write_position_ += encoded.value().size();
+    // 返回 append 之前的position
+    // 因为 Offsetindex 需要记录这个 batch 是从哪个字节开始的
     return position;
 }
 
