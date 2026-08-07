@@ -6,7 +6,6 @@
 #include <thread>
 
 #include "logmq/base/config.h"
-#include "logmq/base/result.h"
 #include "logmq/broker/group_coordinator.h"
 #include "logmq/broker/offset_store.h"
 #include "logmq/broker/topic_manager.h"
@@ -31,8 +30,6 @@ public:
     [[nodiscard]] Status Close();
 
 private:
-    // BrokerService is the protocol/business boundary: it validates typed
-    // requests, calls TopicManager/CommitLog, then maps Status into protocol errors.
     [[nodiscard]] ResponseEnvelope HandleProduce(const RequestEnvelope& envelope,
                                                  const ProduceRequest& request);
     [[nodiscard]] ResponseEnvelope HandleFetch(const RequestEnvelope& envelope,
@@ -66,8 +63,7 @@ private:
     TopicManager topics_;
     OffsetStore offsets_;
     GroupCoordinator groups_;
-    // Async mode batches durability work outside Produce; sync mode flushes
-    // inside HandleProduce before returning success.
+    // 异步模式在 `Produce` 之外批量处理持久化操作；同步模式则在 `HandleProduce` 内部执行刷盘操作，随后才返回成功
     std::thread flusher_;
     std::atomic<bool> stop_flusher_{false};
     std::mutex flusher_mutex_;  // To ensure that releasing the lock and entering sleep are atomic.

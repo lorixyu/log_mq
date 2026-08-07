@@ -19,6 +19,7 @@ void HandleSignal(int) {
     g_stop_requested.store(true);
 }
 
+// 返回命令行参数
 std::string ReadArg(int& index, int argc, char** argv) {
     if (index + 1 >= argc) {
         throw std::runtime_error(std::string("missing value for ") + argv[index]);
@@ -27,6 +28,7 @@ std::string ReadArg(int& index, int argc, char** argv) {
     return argv[index];
 }
 
+// 参数说明
 void PrintUsage() {
     std::cerr << "Usage: logmq_broker [--host HOST] [--port PORT] [--data-dir DIR] "
                  "[--io-threads N] [--worker-threads N]\n";
@@ -37,6 +39,7 @@ void PrintUsage() {
 int main(int argc, char** argv) {
     logmq::Config config;
     try {
+        // 解析启动参数和配置参数
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
             if (arg == "--host") {
@@ -66,15 +69,18 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        // 创建BrokerService和TcpServer
         logmq::BrokerService service(logmq::BrokerServiceOptions{config.storage,
                                                                   config.consumer});
         logmq::TcpServer server(logmq::TcpServerOptionsFromConfig(config), &service);
+        // 启动service，恢复topic，日志和消费进度
         logmq::Status status = service.Start();
         if (!status.ok()) {
             std::cerr << status.ToString() << "\n";
             return 1;
         }
 
+        // 启动server，对外接收请求
         status = server.Start();
         if (!status.ok()) {
             std::cerr << status.ToString() << "\n";

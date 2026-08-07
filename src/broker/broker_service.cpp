@@ -192,6 +192,7 @@ ResponseEnvelope BrokerService::HandleProduce(const RequestEnvelope& envelope,
     }
 
     const std::string_view key = request.records.front().key;
+    // 显式指定partition或者由broker选择，key非空哈希选择，key空轮询选择
     auto partition = topics_.SelectPartition(request.topic, request.partition_id, key);
     if (!partition.ok()) {
         return MakeError(envelope, ProtocolErrorCode::kTopicNotFound,

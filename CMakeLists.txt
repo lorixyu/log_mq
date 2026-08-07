@@ -7,6 +7,7 @@ project(
   LANGUAGES CXX)
 
 option(LOGMQ_BUILD_TESTS "Build LogMQ tests" ON)
+option(LOGMQ_BUILD_BENCHMARKS "Build LogMQ benchmarks" ON)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -79,6 +80,17 @@ target_link_libraries(logmq_cli
     PRIVATE
     logmq::core
 )
+
+if(LOGMQ_BUILD_BENCHMARKS)
+    add_executable(logmq_benchmark
+        benchmarks/logmq_benchmark.cpp
+    )
+
+    target_link_libraries(logmq_benchmark
+        PRIVATE
+        logmq::core
+    )
+endif()
 
 if(MSVC)
     target_compile_options(logmq_core PRIVATE /W4 /permissive-)

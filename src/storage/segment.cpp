@@ -96,6 +96,7 @@ Result<RecordBatch> Segment::Read(std::uint64_t position, std::size_t max_bytes)
 
 Status Segment::Flush() const { return file_.Fsync(); }
 
+// 截断或扩增文件至size大小
 Status Segment::Truncate(std::uint64_t size) {
     if (closed_) {
         return Status::InvalidArgument("truncate on closed segment");

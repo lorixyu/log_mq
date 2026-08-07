@@ -49,6 +49,7 @@ Result<IndexEntry> OffsetIndex::FindFloor(Offset offset) const {
     return *(it - 1);
 }
 
+// 实现”稀疏“，即部分索引
 Status OffsetIndex::MaybeAppend(Offset offset, std::uint64_t position) {
     if (base_offset_ < 0) {
         return Status::InvalidArgument("offset index base_offset must not be negative");
@@ -64,6 +65,7 @@ Status OffsetIndex::MaybeAppend(Offset offset, std::uint64_t position) {
         if (position < last.position) {
             return Status::InvalidArgument("offset index positions must be increasing");
         }
+        // 如果这次position太小，不插入。
         if (position - last.position < interval_bytes_) {
             return Status::Ok();
         }

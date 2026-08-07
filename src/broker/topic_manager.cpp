@@ -110,6 +110,7 @@ Status TopicManager::Load() {
             return Status::Corruption("duplicate topic in metadata: " + topic);
         }
 
+        // 启动时恢复所有Topic
         auto opened = OpenTopic(topic, static_cast<std::uint32_t>(partition_count));
         if (!opened.ok()) {
             return opened.status();
@@ -143,6 +144,7 @@ Status TopicManager::CreateTopic(const TopicName& topic, std::uint32_t partition
         return Status::InvalidArgument("topic already exists with different partition count");
     }
 
+    // 初始化所有的Partition
     auto opened = OpenTopic(topic, partition_count);
     if (!opened.ok()) {
         return opened.status();

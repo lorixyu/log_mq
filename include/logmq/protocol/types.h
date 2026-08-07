@@ -10,7 +10,7 @@
 
 namespace logmq {
 
-// Stable request type identifiers stored in every protocol frame header.
+// 消息类型
 enum class ApiKey : std::uint16_t {
     kProduce = 1,
     kFetch = 2,
@@ -24,7 +24,7 @@ enum class ApiKey : std::uint16_t {
     kLeaveGroup = 10,
 };
 
-// Protocol-level errors carried by error responses.
+// 错误码
 enum class ProtocolErrorCode : std::uint16_t {
     kNone = 0,
     kInvalidRequest = 1,
@@ -38,28 +38,28 @@ enum class ProtocolErrorCode : std::uint16_t {
 
 inline constexpr std::uint16_t kProtocolVersion = 1;
 
-// total_len includes these 16 header bytes and the following body bytes.
+// 客户端需要构造的帧头
 inline constexpr std::size_t kFrameHeaderBytes =
-    sizeof(std::uint32_t) + sizeof(std::uint16_t) + sizeof(std::uint16_t) +
-    sizeof(std::uint64_t);
+    sizeof(std::uint32_t) +  // total_len
+    sizeof(std::uint16_t) +  // api_key
+    sizeof(std::uint16_t) +  // version
+    sizeof(std::uint64_t);   // request_id
 inline constexpr std::uint32_t kMaxFrameBytes = 16 * 1024 * 1024;
 
-// Wire-level record payload for ProduceRequest.
-// Storage RecordBatch encoding is deliberately separate from this format.
 struct ProtocolRecord {
     std::uint64_t timestamp{0};
     std::string key;
     std::string value;
 };
 
-// Append one or more records to a topic partition.
+// 创建消息请求
 struct ProduceRequest {
     TopicName topic;
     PartitionId partition_id{kInvalidPartitionId};
     std::vector<ProtocolRecord> records;
 };
 
-// Fetch records starting at offset from a topic partition.
+// 拉取消息请求
 struct FetchRequest {
     TopicName topic;
     PartitionId partition_id{kInvalidPartitionId};
@@ -67,7 +67,8 @@ struct FetchRequest {
     std::uint32_t max_bytes{0};
 };
 
-// Query topic metadata. An empty topic can later mean "all topics".
+// 查询topic的元数据(topic, partition)
+// struct TopicMetadata;
 struct MetadataRequest {
     TopicName topic;
 };
@@ -98,6 +99,7 @@ struct PartitionAssignment {
     std::vector<PartitionId> partition_ids;
 };
 
+// 加入消费组，注册Consumer
 struct JoinGroupRequest {
     std::string group_id;
     std::string member_id;
@@ -121,8 +123,6 @@ struct LeaveGroupRequest {
     std::string member_id;
 };
 
-// Decoded request body. RequestEnvelope::api_key must match the active 
-// variant alternative; EncodeRequest validates this before writing bytes.
 using RequestBody = std::variant<ProduceRequest,
                                  FetchRequest,
                                  MetadataRequest,
@@ -143,14 +143,11 @@ struct RequestEnvelope {
     RequestBody body{};
 };
 
-// Minimal error response payload for Week 3.
 struct ErrorResponse {
     ProtocolErrorCode error_code{ProtocolErrorCode::kNone};
     std::string message;
 };
 
-// Produce returns the logical offset range assigned to the appended batch.
-// Clients can derive [base_offset, base_offset + record_count).
 struct ProduceResponse {
     PartitionId partition_id{kInvalidPartitionId};
     Offset base_offset{kInvalidOffset};
@@ -197,10 +194,11 @@ struct FetchCommittedOffsetResponse {
 struct JoinGroupResponse {
     std::string group_id;
     std::string member_id;
-    std::int32_t generation_id{0};
-    std::string leader_id;
+    std::int32_t generation_id{0};  // 当前消费组的版本号
+    std::string leader_id;  // 组内leader
 };
 
+// Join之后获取自己负责的partition
 struct SyncGroupResponse {
     std::string group_id;
     std::string member_id;
@@ -222,17 +220,16 @@ struct LeaveGroupResponse {
 
 // Successful response payloads are typed by api_key, just like RequestBody.
 // Error responses keep the right empty alternative so callers can still inspect api_key.
-using ResponseBody =
-    std::variant<ProduceResponse,
-                 FetchResponse,
-                 MetadataResponse,
-                 CreateTopicResponse,
-                 CommitOffsetResponse,
-                 FetchCommittedOffsetResponse,
-                 JoinGroupResponse,
-                 SyncGroupResponse,
-                 HeartbeatResponse,
-                 LeaveGroupResponse>;
+using ResponseBody = std::variant<ProduceResponse,
+                                 FetchResponse,
+                                 MetadataResponse,
+                                 CreateTopicResponse,
+                                 CommitOffsetResponse,
+                                 FetchCommittedOffsetResponse,
+                                 JoinGroupResponse,
+                                 SyncGroupResponse,
+                                 HeartbeatResponse,
+                                 LeaveGroupResponse>;
 
 // Wire body layout is: error_code + message + optional success payload.
 // The success payload is present only when error_code == kNone.

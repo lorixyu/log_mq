@@ -11,12 +11,16 @@
 
 namespace logmq {
 
+// 返回api_key
 [[nodiscard]] std::string_view ApiKeyName(ApiKey api_key);
 
+// 返回ProtocolErrorCode
 [[nodiscard]] std::string_view ProtocolErrorCodeName(ProtocolErrorCode code);
 
+// 把request编码为字节流
 [[nodiscard]] Result<std::vector<std::byte>> EncodeRequest(const RequestEnvelope& request);
 
+// 把字节流解码为RequestEnvelope
 [[nodiscard]] Result<RequestEnvelope> DecodeRequest(std::span<const std::byte> frame);
 
 [[nodiscard]] Result<std::vector<std::byte>> EncodeResponse(const ResponseEnvelope& response);
@@ -31,6 +35,7 @@ class FrameDecoder {
 public:
     explicit FrameDecoder(std::uint32_t max_frame_bytes = kMaxFrameBytes);
 
+    // 解决半包/粘包
     [[nodiscard]] Result<std::vector<RequestEnvelope>> Push(std::span<const std::byte> data);
 
     void Clear();

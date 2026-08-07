@@ -33,12 +33,14 @@ public:
     [[nodiscard]] Result<LeaveGroupResponse> LeaveGroup(const LeaveGroupRequest& request);
 
 private:
+    // 表示一个consumer在broker里的状态
     struct MemberState {
         std::string member_id;
         std::chrono::steady_clock::time_point last_heartbeat;
-        PartitionAssignment assignment;
+        PartitionAssignment assignment;  // 该consumer被分配的Topic和Partition
     };
 
+    // 表示整个消费组的状态
     struct GroupState {
         std::string group_id;
         TopicName topic;
@@ -49,6 +51,7 @@ private:
         std::map<std::string, MemberState> members;
     };
 
+    // 校验合法性
     [[nodiscard]] Status ValidateGroupId(std::string_view group_id) const;
     [[nodiscard]] Status ValidateMemberId(std::string_view member_id) const;
     [[nodiscard]] Status ValidateTopic(std::string_view topic) const;

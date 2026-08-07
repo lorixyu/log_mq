@@ -54,7 +54,7 @@ public:
     [[nodiscard]] Result<Partition*> GetPartition(const TopicName& topic,
                                                   PartitionId partition_id);
 
-    // 根据 hash 选择合适的 Partition; 例如 Produce 发送消息，是需要 select 合适的 partition 的
+    // 根据 hash 或轮询选择合适的 Partition; 例如 Produce 发送消息，是需要 select 合适的 partition 的
     [[nodiscard]] Result<PartitionSelection> SelectPartition(const TopicName& topic,
                                                              PartitionId requested_partition,
                                                              std::string_view key);
@@ -72,6 +72,7 @@ private:
     [[nodiscard]] std::filesystem::path MetadataPath() const;
     [[nodiscard]] std::filesystem::path MetadataTempPath() const;
     // 打开所有 partition 的 CommitLog，构造尚未发布到 topics_ 的 Topic 对象。
+    // 创建和恢复
     [[nodiscard]] Result<std::unique_ptr<Topic>> OpenTopic(const TopicName& topic,
                                                            std::uint32_t partition_count) const;
     [[nodiscard]] Status PersistMetadataLocked() const;

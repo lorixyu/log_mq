@@ -88,14 +88,14 @@ Result<CommitLog> CommitLog::Open(CommitLogOptions options) {
         return Status::IoError("create commit log directory: " + error.message());
     }
 
-    CommitLog log(std::move(options));
-    Status status = log.LoadOrCreateSegments();
+    CommitLog commit_log(std::move(options));
+    Status status = commit_log.LoadOrCreateSegments();
     if (!status.ok()) {
         return status;
     }
 
-    log.closed_ = false;
-    return std::move(log);
+    commit_log.closed_ = false;
+    return std::move(commit_log);
 }
 
 // 将消息 append 到当前partition 末尾的 segment，已满则新建 segment 文件 
@@ -145,6 +145,7 @@ Result<AppendResult> CommitLog::Append(std::vector<Record> records) {
     return AppendResult{batch.value().base_offset, position.value(), target.path()};
 }
 
+// 读取 offset 的 batch，利用稀疏索引加速
 Result<RecordBatch> CommitLog::Read(Offset offset, std::size_t max_bytes) const {
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -168,8 +169,10 @@ Result<RecordBatch> CommitLog::Read(Offset offset, std::size_t max_bytes) const 
     const OffsetIndex& index = indexes_[segment_index.value()];
 
     std::uint64_t position = 0;
+    // 查找最近的 batch 的起始位置的 entries_
     auto floor_entry = index.FindFloor(offset);
     if (floor_entry.ok()) {
+        // 加速部分
         position = floor_entry.value().position;
     } else if (floor_entry.status().code() != ErrorCode::kNotFound) {
         return floor_entry.status();
@@ -180,6 +183,8 @@ Result<RecordBatch> CommitLog::Read(Offset offset, std::size_t max_bytes) const 
         if (!batch.ok()) {
             return batch.status();
         }
+        // 判断该batch是否包含该offset
+        // true 返回 false，position跳过batch继续Read
         if (BatchContainsOffset(batch.value(), offset)) {
             return batch.value();
         }
@@ -247,27 +252,32 @@ std::size_t CommitLog::segment_count() const {
 Status CommitLog::LoadOrCreateSegments() {
     // Segment file order and path pair list.
     std::vector<std::pair<Offset, std::filesystem::path>> logs;
-    // for(): Scan directory files to build logs. (Disorder)
+    // 遍历log文件目录，不保证offset有序
     for (const auto& entry : std::filesystem::directory_iterator(options_.data_dir)) {
-        // Only 
+        // 不是普通文件 或者 不是.log文件则continue
         if (!entry.is_regular_file() || entry.path().extension() != ".log") {
             continue;
         }
 
         Offset base_offset = kInvalidOffset;
+        // 从文件解析出offset
         if (!ParseBaseOffset(entry.path(), base_offset)) {
             continue;
         }
+        // 文件offset和path构造logs
         logs.emplace_back(base_offset, entry.path());
     }
     // Order logs.
     std::sort(logs.begin(), logs.end(),
               [](const auto& left, const auto& right) { return left.first < right.first; });
 
+    // log文件目录为空
     if (logs.empty()) {
+        // 创建00...0.log
         return RollSegment(0);
     }
 
+    // 根据log文件目录重建segments_和indexs_列表
     for (const auto& [base_offset, path] : logs) {
         auto segment = Segment::Open(path, base_offset);
         if (!segment.ok()) {
@@ -291,8 +301,8 @@ Status CommitLog::LoadOrCreateSegments() {
     return Status::Ok();
 }
 
-Result<CommitLog::RecoveryResult> CommitLog::RecoverSegment(Segment& segment,
-                                                            OffsetIndex& index) {
+// 崩溃重启后，扫描 segment 日志文件，恢复有效日志边界，重新计算下一个 offset，并重建 OffsetIndex
+Result<CommitLog::RecoveryResult> CommitLog::RecoverSegment(Segment& segment, OffsetIndex& index) {
     index.Clear();
 
     std::uint64_t position = 0;
@@ -321,6 +331,8 @@ Result<CommitLog::RecoveryResult> CommitLog::RecoverSegment(Segment& segment,
             batch.value().base_offset + static_cast<Offset>(batch.value().record_count));
     }
 
+    // 脏尾截断
+    // 截取文件为实际Read到的数据
     if (position != file_size) {
         Status status = segment.Truncate(position);
         if (!status.ok()) {
@@ -353,7 +365,7 @@ Result<std::size_t> CommitLog::FindSegmentIndex(Offset offset) const {
     return static_cast<std::size_t>((it - 1) - segments_.begin());
 }
 
-// 打开或创建一个新的 segment
+// 根据offset打开或创建一个新的 segment
 Status CommitLog::RollSegment(Offset base_offset) {
     auto segment = Segment::Open(SegmentPath(base_offset), base_offset);
     if (!segment.ok()) {
