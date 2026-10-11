@@ -21,6 +21,8 @@ struct CommitLogOptions {
     std::filesystem::path data_dir;                  // Data directory
     std::uint64_t segment_bytes{128 * 1024 * 1024};  // The max size of a segment file
     std::uint64_t index_interval_bytes{4 * 1024};    // The interval of index. Single segment file (local).
+    // Only an incomplete batch at the active segment tail may be truncated.
+    bool strict_recovery{false};
 };
 
 struct AppendResult {
@@ -60,7 +62,8 @@ private:
 
     Status LoadOrCreateSegments();
 
-    Result<RecoveryResult> RecoverSegment(Segment& segment, OffsetIndex& index);
+    Result<RecoveryResult> RecoverSegment(Segment& segment, OffsetIndex& index,
+                                         bool active_segment);
 
     Result<std::size_t> FindSegmentIndex(Offset offset) const;
 

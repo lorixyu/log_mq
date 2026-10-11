@@ -1,4 +1,5 @@
 #include "logmq/broker/group_coordinator.h"
+#include "logmq/broker/retry_scheduler.h"
 
 #include <algorithm>
 #include <cctype>
@@ -13,6 +14,9 @@ namespace logmq {
 namespace {
 
 Status ValidateSafeName(std::string_view name, std::string_view field) {
+    if (field == "topic" && IsInternalTopic(name)) {
+        name.remove_prefix(IsRetryTopic(name) ? kRetryTopicPrefix.size() : kDlqTopicPrefix.size());
+    }
     if (name.empty()) {
         return Status::InvalidArgument(std::string(field) + " must not be empty");
     }

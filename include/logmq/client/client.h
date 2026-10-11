@@ -23,11 +23,16 @@ struct ClientOptions {
 class ClientConnection {
 public:
     explicit ClientConnection(ClientOptions options);
+    ~ClientConnection();
 
     [[nodiscard]] Result<ResponseEnvelope> RoundTrip(const RequestEnvelope& request) const;
 
 private:
+    void Disconnect() const;
+
     ClientOptions options_;
+    mutable std::mutex mutex_;
+    mutable int fd_{-1};
 };
 
 class AdminClient {
@@ -79,6 +84,7 @@ struct ConsumerRecord {
     std::uint64_t timestamp{0};
     std::string key;
     std::string value;
+    std::optional<RetryMetadata> retry{};
 };
 
 class Consumer {
@@ -90,6 +96,8 @@ public:
     [[nodiscard]] Result<std::vector<ConsumerRecord>> Poll(
         std::chrono::milliseconds timeout);
     [[nodiscard]] Result<void> Seek(PartitionId partition_id, Offset offset);
+    [[nodiscard]] Result<void> Seek(const TopicName& topic, PartitionId partition_id, Offset offset);
+    [[nodiscard]] Result<NackResponse> Nack(const ConsumerRecord& record, std::string reason);
     [[nodiscard]] Result<void> CommitSync();
     [[nodiscard]] Result<void> Close();
     [[nodiscard]] std::vector<PartitionId> AssignedPartitions() const;
@@ -98,6 +106,7 @@ private:
     struct Assignment {
         PartitionId partition_id{kInvalidPartitionId};
         Offset next_offset{0};
+        Offset retry_next_offset{0};
     };
 
     [[nodiscard]] Result<void> JoinAndSync();

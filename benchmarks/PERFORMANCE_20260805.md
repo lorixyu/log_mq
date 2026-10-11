@@ -82,11 +82,11 @@ The corresponding end-to-end Broker median is 77,834 Produce records/s. The appr
 
 ## Short-Connection Finding
 
-The current public SDK creates a TCP connection for every request. A short-connection run succeeded at 500 sequential records but repeatedly failed by 2,000 records with `Connection reset by peer`.
+At the time of this report, the public SDK created a TCP connection for every request. A short-connection run succeeded at 500 sequential records but repeatedly failed by 2,000 records with `Connection reset by peer`.
 
-A current working hypothesis is fd reuse in `TcpServer`: connections are stored and removed only by numeric fd, so rapid close/reconnect churn may let a reused fd collide with an older connection entry or be erased by the older close callback. This has not yet been proven with tracing or a minimal reproducer. Persistent connections avoid the observed failure path.
+One suspected cause in the original run was fd reuse in `TcpServer`: rapid close/reconnect churn could let a reused fd collide with an older connection entry. This was not proven with tracing or a minimal reproducer. Persistent connections avoid that path and reduce short-connection churn.
 
-Do not quote the persistent-connection benchmark as current SDK throughput. Describe it as Broker protocol throughput, then state that connection pooling/persistent SDK connections are the next engineering step.
+As of 2026-09-26, `ClientConnection` reuses a TCP connection and reconnects on the next request after an I/O failure. The Broker now removes closed connections from its fd map before closing the fd, synchronizes connection-count reads, and drains pending connection work before stopping IO loops. The historical failure has not been isolated to a single cause; repeated short-connection stress can also exhaust local ephemeral ports. Do not quote the persistent-connection benchmark as SDK throughput until the SDK itself is rebenchmarked.
 
 ## Resume-Safe Statement
 

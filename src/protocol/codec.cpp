@@ -81,6 +81,8 @@ public:
         return value;
     }
 
+    [[nodiscard]] std::size_t remaining() const { return data_.size() - offset_; }
+
     [[nodiscard]] bool consumed() const { return offset_ == data_.size(); }
 
 private:
@@ -123,6 +125,8 @@ Result<ApiKey> ParseApiKey(std::uint16_t value) {
             return ApiKey::kSyncGroup;
         case static_cast<std::uint16_t>(ApiKey::kHeartbeat):
             return ApiKey::kHeartbeat;
+        case static_cast<std::uint16_t>(ApiKey::kNack):
+            return ApiKey::kNack;
         case static_cast<std::uint16_t>(ApiKey::kLeaveGroup):
             return ApiKey::kLeaveGroup;
     }
@@ -652,8 +656,117 @@ Result<LeaveGroupRequest> DecodeLeaveGroupBody(std::span<const std::byte> body) 
     return request;
 }
 
+
+Status AppendRetryMetadata(const RetryMetadata& retry, std::vector<std::byte>& body) {
+    if (retry.retry_count == 0 || retry.original_topic.empty() ||
+        retry.original_partition < 0 || retry.original_offset < 0) {
+        return Status::InvalidArgument("invalid retry metadata");
+    }
+    AppendBigEndian<std::uint32_t>(retry.retry_count, body);
+    AppendBigEndian<std::uint64_t>(retry.next_visible_time, body);
+    Status status = AppendString(retry.original_topic, body);
+    if (!status.ok()) return status;
+    status = AppendString(retry.failure_reason, body);
+    if (!status.ok()) return status;
+    AppendPartitionId(retry.original_partition, body);
+    AppendBigEndian<std::uint64_t>(static_cast<std::uint64_t>(retry.original_offset), body);
+    return Status::Ok();
+}
+
+Result<RetryMetadata> DecodeRetryMetadata(BodyReader& reader) {
+    auto count = reader.ReadUInt<std::uint32_t>();
+    if (!count.ok()) return count.status();
+    auto time = reader.ReadUInt<std::uint64_t>();
+    if (!time.ok()) return time.status();
+    auto topic = reader.ReadString();
+    if (!topic.ok()) return topic.status();
+    auto reason = reader.ReadString();
+    if (!reason.ok()) return reason.status();
+    auto partition = reader.ReadUInt<std::uint32_t>();
+    if (!partition.ok()) return partition.status();
+    auto offset = reader.ReadUInt<std::uint64_t>();
+    if (!offset.ok()) return offset.status();
+    if (count.value() == 0 || topic.value().empty() || DecodePartitionId(partition.value()) < 0 ||
+        offset.value() > static_cast<std::uint64_t>(std::numeric_limits<Offset>::max())) {
+        return Status::InvalidArgument("invalid retry metadata");
+    }
+    return RetryMetadata{count.value(), time.value(), std::move(topic).value(),
+        std::move(reason).value(), DecodePartitionId(partition.value()),
+        static_cast<Offset>(offset.value())};
+}
+
+Result<std::vector<std::byte>> EncodeNackBody(const NackRequest& request) {
+    if (request.topic.empty() || request.partition_id < 0 || request.offset < 0) {
+        return Status::InvalidArgument("invalid nack location");
+    }
+    std::vector<std::byte> body;
+    Status status = AppendString(request.topic, body);
+    if (!status.ok()) return status;
+    AppendPartitionId(request.partition_id, body);
+    AppendBigEndian<std::uint64_t>(static_cast<std::uint64_t>(request.offset), body);
+    status = AppendString(request.reason, body);
+    if (!status.ok()) return status;
+    return body;
+}
+
+Result<NackRequest> DecodeNackBody(std::span<const std::byte> body) {
+    BodyReader reader(body);
+    auto topic = reader.ReadString();
+    if (!topic.ok()) return topic.status();
+    auto partition = reader.ReadUInt<std::uint32_t>();
+    if (!partition.ok()) return partition.status();
+    auto offset = reader.ReadUInt<std::uint64_t>();
+    if (!offset.ok()) return offset.status();
+    auto reason = reader.ReadString();
+    if (!reason.ok()) return reason.status();
+    if (!reader.consumed() || topic.value().empty() || DecodePartitionId(partition.value()) < 0 ||
+        offset.value() > static_cast<std::uint64_t>(std::numeric_limits<Offset>::max())) {
+        return Status::InvalidArgument("invalid nack body");
+    }
+    return NackRequest{std::move(topic).value(), DecodePartitionId(partition.value()),
+        static_cast<Offset>(offset.value()), std::move(reason).value()};
+}
+
+Result<std::vector<std::byte>> EncodeNackResponseBody(const NackResponse& response) {
+    auto body = EncodeNackBody(NackRequest{response.topic, response.partition_id,
+        response.offset, ""});
+    if (!body.ok()) return body.status();
+    Status status = AppendRetryMetadata(response.retry, body.value());
+    if (!status.ok()) return status;
+    AppendBigEndian<std::uint8_t>(response.dead_letter ? 1 : 0, body.value());
+    return std::move(body).value();
+}
+
+Result<NackResponse> DecodeNackResponseBody(BodyReader& reader) {
+    auto topic = reader.ReadString();
+    if (!topic.ok()) return topic.status();
+    auto partition = reader.ReadUInt<std::uint32_t>();
+    if (!partition.ok()) return partition.status();
+    auto offset = reader.ReadUInt<std::uint64_t>();
+    if (!offset.ok()) return offset.status();
+    // The common Nack location encoder includes an empty reason string.
+    auto reason = reader.ReadString();
+    if (!reason.ok()) return reason.status();
+    auto retry = DecodeRetryMetadata(reader);
+    if (!retry.ok()) return retry.status();
+    auto dlq = reader.ReadUInt<std::uint8_t>();
+    if (!dlq.ok()) return dlq.status();
+    if (topic.value().empty() || DecodePartitionId(partition.value()) < 0 ||
+        offset.value() > static_cast<std::uint64_t>(std::numeric_limits<Offset>::max()) ||
+        !reason.value().empty() || dlq.value() > 1) {
+        return Status::InvalidArgument("invalid nack response");
+    }
+    return NackResponse{std::move(topic).value(), DecodePartitionId(partition.value()),
+        static_cast<Offset>(offset.value()), std::move(retry).value(), dlq.value() == 1};
+}
+
 Result<std::vector<std::byte>> EncodeRequestBody(const RequestEnvelope& request) {
     switch (request.api_key) {
+        case ApiKey::kNack:
+            if (!std::holds_alternative<NackRequest>(request.body)) {
+                return Status::InvalidArgument("nack request envelope has wrong body type");
+            }
+            return EncodeNackBody(std::get<NackRequest>(request.body));
         case ApiKey::kProduce:
             if (!std::holds_alternative<ProduceRequest>(request.body)) {
                 return Status::InvalidArgument("produce request envelope has wrong body type");
@@ -725,7 +838,7 @@ Result<std::vector<std::byte>> EncodeProduceResponseBody(const ProduceResponse& 
     return body;
 }
 
-Result<std::vector<std::byte>> EncodeFetchResponseBody(const FetchResponse& response) {
+Result<std::vector<std::byte>> EncodeFetchResponseBody(const FetchResponse& response, std::uint16_t version) {
     if (response.base_offset < 0) {
         return Status::InvalidArgument("fetch response base_offset must not be negative");
     }
@@ -744,6 +857,13 @@ Result<std::vector<std::byte>> EncodeFetchResponseBody(const FetchResponse& resp
         Status status = AppendProtocolRecord(record, body);
         if (!status.ok()) {
             return status;
+        }
+        if (version == kRetryProtocolVersion) {
+            AppendBigEndian<std::uint8_t>(record.retry ? 1 : 0, body);
+            if (record.retry) {
+                status = AppendRetryMetadata(*record.retry, body);
+                if (!status.ok()) return status;
+            }
         }
     }
     return body;
@@ -930,6 +1050,11 @@ Result<std::vector<std::byte>> EncodeResponseBody(const ResponseEnvelope& respon
     // The api_key selects the response schema. This keeps callers from sending
     // a MetadataResponse inside a Produce frame by mistake.
     switch (response.api_key) {
+        case ApiKey::kNack:
+            if (!std::holds_alternative<NackResponse>(response.body)) {
+                return Status::InvalidArgument("nack response envelope has wrong body type");
+            }
+            return EncodeNackResponseBody(std::get<NackResponse>(response.body));
         case ApiKey::kProduce:
             if (!std::holds_alternative<ProduceResponse>(response.body)) {
                 return Status::InvalidArgument("produce response envelope has wrong body type");
@@ -939,7 +1064,7 @@ Result<std::vector<std::byte>> EncodeResponseBody(const ResponseEnvelope& respon
             if (!std::holds_alternative<FetchResponse>(response.body)) {
                 return Status::InvalidArgument("fetch response envelope has wrong body type");
             }
-            return EncodeFetchResponseBody(std::get<FetchResponse>(response.body));
+            return EncodeFetchResponseBody(std::get<FetchResponse>(response.body), response.version);
         case ApiKey::kMetadata:
             if (!std::holds_alternative<MetadataResponse>(response.body)) {
                 return Status::InvalidArgument("metadata response envelope has wrong body type");
@@ -990,6 +1115,8 @@ ResponseBody EmptyResponseBodyFor(ApiKey api_key) {
     // Error responses have no success payload, but keeping the matching variant
     // alternative makes decoded responses easier to inspect in tests and clients.
     switch (api_key) {
+        case ApiKey::kNack:
+            return ResponseBody{std::in_place_type<NackResponse>};
         case ApiKey::kProduce:
             return ResponseBody{std::in_place_type<ProduceResponse>};
         case ApiKey::kFetch:
@@ -1035,7 +1162,7 @@ Result<ProduceResponse> DecodeProduceResponseBody(BodyReader& reader) {
     return response;
 }
 
-Result<FetchResponse> DecodeFetchResponseBody(BodyReader& reader) {
+Result<FetchResponse> DecodeFetchResponseBody(BodyReader& reader, std::uint16_t version) {
     auto base_offset = reader.ReadUInt<std::uint64_t>();
     if (!base_offset.ok()) {
         return base_offset.status();
@@ -1052,11 +1179,24 @@ Result<FetchResponse> DecodeFetchResponseBody(BodyReader& reader) {
     FetchResponse response;
     response.base_offset = static_cast<Offset>(base_offset.value());
     response.high_watermark = static_cast<Offset>(high_watermark.value());
+    if (record_count.value() > reader.remaining() / 16) {
+        return Status::InvalidArgument("fetch record count exceeds body size");
+    }
     response.records.reserve(record_count.value());
     for (std::uint32_t i = 0; i < record_count.value(); ++i) {
         auto record = DecodeProtocolRecord(reader);
         if (!record.ok()) {
             return record.status();
+        }
+        if (version == kRetryProtocolVersion) {
+            auto present = reader.ReadUInt<std::uint8_t>();
+            if (!present.ok()) return present.status();
+            if (present.value() > 1) return Status::InvalidArgument("invalid retry presence flag");
+            if (present.value() == 1) {
+                auto retry = DecodeRetryMetadata(reader);
+                if (!retry.ok()) return retry.status();
+                record.value().retry = std::move(retry).value();
+            }
         }
         response.records.push_back(std::move(record).value());
     }
@@ -1299,8 +1439,13 @@ Result<LeaveGroupResponse> DecodeLeaveGroupResponseBody(BodyReader& reader) {
     return response;
 }
 
-Result<ResponseBody> DecodeResponseBody(ApiKey api_key, BodyReader& reader) {
+Result<ResponseBody> DecodeResponseBody(ApiKey api_key, BodyReader& reader, std::uint16_t version) {
     switch (api_key) {
+        case ApiKey::kNack: {
+            auto response = DecodeNackResponseBody(reader);
+            if (!response.ok()) return response.status();
+            return ResponseBody{std::in_place_type<NackResponse>, std::move(response).value()};
+        }
         case ApiKey::kProduce: {
             auto response = DecodeProduceResponseBody(reader);
             if (!response.ok()) {
@@ -1309,7 +1454,7 @@ Result<ResponseBody> DecodeResponseBody(ApiKey api_key, BodyReader& reader) {
             return ResponseBody{std::in_place_type<ProduceResponse>, std::move(response).value()};
         }
         case ApiKey::kFetch: {
-            auto response = DecodeFetchResponseBody(reader);
+            auto response = DecodeFetchResponseBody(reader, version);
             if (!response.ok()) {
                 return response.status();
             }
@@ -1384,6 +1529,11 @@ Result<ResponseBody> DecodeResponseBody(ApiKey api_key, BodyReader& reader) {
 // Construct a RequestBody(std::variant<>) from the body byte stream accoding to the api_key.
 Result<RequestBody> DecodeRequestBody(ApiKey api_key, std::span<const std::byte> body) {
     switch (api_key) {
+        case ApiKey::kNack: {
+            auto request = DecodeNackBody(body);
+            if (!request.ok()) return request.status();
+            return RequestBody{std::in_place_type<NackRequest>, std::move(request).value()};
+        }
         case ApiKey::kProduce: {
             auto request = DecodeProduceBody(body);
             if (!request.ok()) {
@@ -1475,6 +1625,8 @@ Result<std::uint32_t> PeekFrameLength(std::span<const std::byte> data) {
 
 std::string_view ApiKeyName(ApiKey api_key) {
     switch (api_key) {
+        case ApiKey::kNack:
+            return "Nack";
         case ApiKey::kProduce:
             return "Produce";
         case ApiKey::kFetch:
@@ -1522,7 +1674,7 @@ std::string_view ProtocolErrorCodeName(ProtocolErrorCode code) {
 }
 
 Result<std::vector<std::byte>> EncodeRequest(const RequestEnvelope& request) {
-    if (request.version != kProtocolVersion) {
+    if (!SupportedProtocolVersion(request.version)) {
         return Status::InvalidArgument("unsupported protocol version");
     }
 
@@ -1564,7 +1716,7 @@ Result<RequestEnvelope> DecodeRequest(std::span<const std::byte> frame) {
     if (!version.ok()) {
         return version.status();
     }
-    if (version.value() != kProtocolVersion) {
+    if (!SupportedProtocolVersion(version.value())) {
         return Status::InvalidArgument("unsupported protocol version");
     }
 
@@ -1589,7 +1741,7 @@ Result<RequestEnvelope> DecodeRequest(std::span<const std::byte> frame) {
 }
 
 Result<std::vector<std::byte>> EncodeResponse(const ResponseEnvelope& response) {
-    if (response.version != kProtocolVersion) {
+    if (!SupportedProtocolVersion(response.version)) {
         return Status::InvalidArgument("unsupported protocol version");
     }
 
@@ -1625,7 +1777,7 @@ Result<std::vector<std::byte>> EncodeErrorResponse(ApiKey api_key,
                                                    std::uint64_t request_id, 
                                                    ProtocolErrorCode code,
                                                    std::string_view message) {
-    if (version != kProtocolVersion) {
+    if (!SupportedProtocolVersion(version)) {
         return Status::InvalidArgument("unsupported protocol version");
     }
 
@@ -1666,7 +1818,7 @@ Result<ResponseEnvelope> DecodeResponse(std::span<const std::byte> frame) {
     if (!version.ok()) {
         return version.status();
     }
-    if (version.value() != kProtocolVersion) {
+    if (!SupportedProtocolVersion(version.value())) {
         return Status::InvalidArgument("unsupported protocol version");
     }
 
@@ -1700,7 +1852,7 @@ Result<ResponseEnvelope> DecodeResponse(std::span<const std::byte> frame) {
     // The common error envelope has already been decoded. Success responses now
     // consume the remaining bytes as the api-specific payload.
     if (response.error.error_code == ProtocolErrorCode::kNone) {
-        auto body = DecodeResponseBody(response.api_key, reader);
+        auto body = DecodeResponseBody(response.api_key, reader, response.version);
         if (!body.ok()) {
             return body.status();
         }

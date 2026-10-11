@@ -1,15 +1,19 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <arpa/inet.h>
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <mutex>
+#include <poll.h>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -48,10 +52,11 @@ private:
 
 class RunningServer {
 public:
-    RunningServer() {
+    explicit RunningServer(RetryOptions retry = {}) {
         BrokerServiceOptions service_options;
         service_options.storage.data_dir = temp_dir_.path();
         service_options.storage.segment_bytes = 1024 * 1024;
+        service_options.retry = retry;
         service_ = std::make_unique<BrokerService>(std::move(service_options));
         Status service_status = service_->Start();
         if (!service_status.ok()) {
@@ -337,6 +342,208 @@ TEST(NetworkIntegrationTest, ClientSdkProducesPollsAndCommitsOffsets) {
     EXPECT_TRUE(empty.value().empty());
 }
 
+TEST(NetworkIntegrationTest, ClientSdkFetchesOrdinaryMessageAtFrameLimit) {
+    RunningServer server;
+    ClientOptions options{"127.0.0.1", server.port(), std::chrono::seconds(15)};
+    AdminClient admin(options);
+    ASSERT_TRUE(admin.CreateTopic("a", 1).ok());
+    // A v1 Fetch response for topic "a" and an empty key adds 58 bytes.
+    const std::string value(kMaxFrameBytes - 58, 'x');
+    Producer producer(ProducerOptions{options});
+    auto produced = producer.Send("a", "", value, 0);
+    ASSERT_TRUE(produced.ok()) << produced.status().ToString();
+
+    Consumer consumer(ConsumerOptions{options, "frame-limit-group", kMaxFrameBytes});
+    ASSERT_TRUE(consumer.Subscribe("a").ok());
+    auto records = consumer.Poll(std::chrono::milliseconds(0));
+    ASSERT_TRUE(records.ok()) << records.status().ToString();
+    ASSERT_EQ(records.value().size(), 1U);
+    EXPECT_EQ(records.value().front().topic, "a");
+    EXPECT_EQ(records.value().front().value, value);
+}
+
+TEST(NetworkIntegrationTest, ClientSdkRetriesAfterDefaultFiveSeconds) {
+    RunningServer server;
+    ClientOptions options{"127.0.0.1", server.port()};
+    AdminClient admin(options);
+    ASSERT_TRUE(admin.CreateTopic("retry_default", 1).ok());
+    Producer producer(ProducerOptions{options});
+    ASSERT_TRUE(producer.Send("retry_default", "key", "value", 0).ok());
+    Consumer consumer(ConsumerOptions{options, "retry-default-group"});
+    ASSERT_TRUE(consumer.Subscribe("retry_default").ok());
+    auto records = consumer.Poll(std::chrono::milliseconds(0));
+    ASSERT_TRUE(records.ok()) << records.status().ToString();
+    ASSERT_EQ(records.value().size(), 1);
+    const auto start = std::chrono::steady_clock::now();
+    auto nack = consumer.Nack(records.value().front(), "handler failed");
+    ASSERT_TRUE(nack.ok()) << nack.status().ToString();
+    EXPECT_EQ(nack.value().topic, "%RETRY%retry_default");
+    EXPECT_EQ(nack.value().retry.retry_count, 1);
+    EXPECT_FALSE(nack.value().dead_letter);
+    // Nack does not implicitly commit the original record.
+    ClientConnection connection(options);
+    RequestEnvelope committed;
+    committed.api_key = ApiKey::kFetchCommittedOffset;
+    committed.body = FetchCommittedOffsetRequest{"retry-default-group", "retry_default", 0};
+    auto offset = connection.RoundTrip(committed);
+    ASSERT_TRUE(offset.ok());
+    EXPECT_FALSE(std::get<FetchCommittedOffsetResponse>(offset.value().body).committed);
+    ASSERT_TRUE(consumer.CommitSync().ok());
+    auto early = consumer.Poll(std::chrono::milliseconds(100));
+    ASSERT_TRUE(early.ok());
+    EXPECT_TRUE(early.value().empty());
+    auto retried = consumer.Poll(std::chrono::seconds(7));
+    ASSERT_TRUE(retried.ok()) << retried.status().ToString();
+    ASSERT_EQ(retried.value().size(), 1);
+    EXPECT_GE(std::chrono::steady_clock::now() - start, std::chrono::milliseconds(4900));
+    const auto& record = retried.value().front();
+    EXPECT_EQ(record.topic, "%RETRY%retry_default");
+    EXPECT_EQ(record.offset, 0);
+    EXPECT_EQ(record.value, "value");
+    ASSERT_TRUE(record.retry);
+    EXPECT_EQ(record.retry->original_topic, "retry_default");
+    EXPECT_EQ(record.retry->failure_reason, "handler failed");
+    EXPECT_EQ(record.retry->retry_count, 1);
+}
+
+TEST(NetworkIntegrationTest, ClientSdkThreeRetriesDlqAndSeparateCommittedOffsets) {
+    RunningServer server(RetryOptions{std::chrono::milliseconds(30), 3});
+    ClientOptions options{"127.0.0.1", server.port()};
+    AdminClient admin(options);
+    ASSERT_TRUE(admin.CreateTopic("retry_sdk", 1).ok());
+    Producer producer(ProducerOptions{options});
+    ASSERT_TRUE(producer.Send("retry_sdk", "key", "value", 0).ok());
+    ConsumerOptions consumer_options{options, "retry-sdk-group"};
+    Consumer consumer(consumer_options);
+    ASSERT_TRUE(consumer.Subscribe("retry_sdk").ok());
+    auto records = consumer.Poll(std::chrono::milliseconds(0));
+    ASSERT_TRUE(records.ok());
+    ASSERT_EQ(records.value().size(), 1);
+    for (std::uint32_t count = 1; count <= 4; ++count) {
+        auto nack = consumer.Nack(records.value().front(), "failure-" + std::to_string(count));
+        ASSERT_TRUE(nack.ok()) << nack.status().ToString();
+        EXPECT_EQ(nack.value().retry.retry_count, count);
+        EXPECT_EQ(nack.value().dead_letter, count == 4);
+        ASSERT_TRUE(consumer.CommitSync().ok());
+        if (count == 4) break;
+        records = consumer.Poll(std::chrono::seconds(2));
+        ASSERT_TRUE(records.ok()) << records.status().ToString();
+        ASSERT_EQ(records.value().size(), 1);
+        ASSERT_TRUE(records.value().front().retry);
+        EXPECT_EQ(records.value().front().retry->retry_count, count);
+        EXPECT_EQ(records.value().front().offset, count - 1);
+    }
+    ASSERT_TRUE(consumer.Close().ok());
+    Consumer resumed(consumer_options);
+    ASSERT_TRUE(resumed.Subscribe("retry_sdk").ok());
+    auto empty = resumed.Poll(std::chrono::milliseconds(100));
+    ASSERT_TRUE(empty.ok()) << empty.status().ToString();
+    EXPECT_TRUE(empty.value().empty());
+    // Explicitly subscribing to DLQ reads it without automatically retrying it.
+    Consumer dlq(ConsumerOptions{options, "dlq-inspector"});
+    ASSERT_TRUE(dlq.Subscribe("%DLQ%retry_sdk").ok());
+    auto dead = dlq.Poll(std::chrono::milliseconds(0));
+    ASSERT_TRUE(dead.ok()) << dead.status().ToString();
+    ASSERT_EQ(dead.value().size(), 1);
+    ASSERT_TRUE(dead.value().front().retry);
+    EXPECT_EQ(dead.value().front().retry->retry_count, 4);
+    EXPECT_EQ(dead.value().front().value, "value");
+    EXPECT_FALSE(dlq.Nack(dead.value().front(), "again").ok());
+    ASSERT_TRUE(dlq.CommitSync().ok());
+    auto no_more = dlq.Poll(std::chrono::milliseconds(50));
+    ASSERT_TRUE(no_more.ok());
+    EXPECT_TRUE(no_more.value().empty());
+    EXPECT_FALSE(consumer.Nack(dead.value().front(), "closed").ok());
+}
+
+TEST(NetworkIntegrationTest, ClientSdkRetrySeekAndResubscribeKeepTopicsSeparate) {
+    RunningServer server(RetryOptions{std::chrono::milliseconds(20), 3});
+    ClientOptions options{"127.0.0.1", server.port()};
+    AdminClient admin(options);
+    ASSERT_TRUE(admin.CreateTopic("retry_seek", 1).ok());
+    ASSERT_TRUE(admin.CreateTopic("other", 1).ok());
+    Producer producer(ProducerOptions{options});
+    ASSERT_TRUE(producer.Send("retry_seek", "key", "failed", 0).ok());
+    Consumer consumer(ConsumerOptions{options, "retry-seek-group"});
+    ASSERT_TRUE(consumer.Subscribe("retry_seek").ok());
+    auto original = consumer.Poll(std::chrono::milliseconds(0));
+    ASSERT_TRUE(original.ok());
+    ASSERT_EQ(original.value().size(), 1);
+    ASSERT_TRUE(consumer.Nack(original.value().front(), "failure").ok());
+    ASSERT_TRUE(consumer.CommitSync().ok());
+    auto retry = consumer.Poll(std::chrono::seconds(2));
+    ASSERT_TRUE(retry.ok());
+    ASSERT_EQ(retry.value().size(), 1);
+    ASSERT_TRUE(consumer.Seek("%RETRY%retry_seek", 0, 0).ok());
+    auto reread = consumer.Poll(std::chrono::milliseconds(0));
+    ASSERT_TRUE(reread.ok());
+    ASSERT_EQ(reread.value().size(), 1);
+    EXPECT_EQ(reread.value().front().topic, "%RETRY%retry_seek");
+    ASSERT_TRUE(consumer.CommitSync().ok());
+    ASSERT_TRUE(consumer.Subscribe("other").ok());
+    auto empty = consumer.Poll(std::chrono::milliseconds(0));
+    ASSERT_TRUE(empty.ok());
+    EXPECT_TRUE(empty.value().empty());
+    EXPECT_FALSE(consumer.Nack(original.value().front(), "wrong subscription").ok());
+    ASSERT_TRUE(consumer.Subscribe("retry_seek").ok());
+    auto restored = consumer.Poll(std::chrono::milliseconds(0));
+    ASSERT_TRUE(restored.ok());
+    EXPECT_TRUE(restored.value().empty());
+}
+
+TEST(NetworkIntegrationTest, ClientSdkRebalanceRestoresRetryPositions) {
+    RunningServer server(RetryOptions{std::chrono::milliseconds(50), 3});
+    ClientOptions options{"127.0.0.1", server.port()};
+    AdminClient admin(options);
+    ASSERT_TRUE(admin.CreateTopic("retry_rebalance", 2).ok());
+    Producer producer(ProducerOptions{options});
+    for (int partition = 0; partition < 2; ++partition) {
+        ASSERT_TRUE(producer.Send("retry_rebalance", "key", "value", partition).ok());
+    }
+    ConsumerOptions consumer_options{options, "retry-rebalance-group", 4096,
+                                      std::chrono::milliseconds(20)};
+    Consumer first(consumer_options);
+    ASSERT_TRUE(first.Subscribe("retry_rebalance").ok());
+    auto original = first.Poll(std::chrono::milliseconds(0));
+    ASSERT_TRUE(original.ok());
+    ASSERT_EQ(original.value().size(), 2);
+    for (const auto& record : original.value()) ASSERT_TRUE(first.Nack(record, "failure").ok());
+    ASSERT_TRUE(first.CommitSync().ok());
+    // Poll may return one partition before the other's retry becomes visible.
+    std::vector<ConsumerRecord> retried;
+    const auto retry_limit = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (retried.size() < 2 && std::chrono::steady_clock::now() < retry_limit) {
+        auto polled = first.Poll(std::chrono::milliseconds(30));
+        ASSERT_TRUE(polled.ok()) << polled.status().ToString();
+        retried.insert(retried.end(), polled.value().begin(), polled.value().end());
+    }
+    ASSERT_EQ(retried.size(), 2);
+    EXPECT_NE(retried[0].partition_id, retried[1].partition_id);
+    ASSERT_TRUE(first.CommitSync().ok());
+    Consumer second(consumer_options);
+    ASSERT_TRUE(second.Subscribe("retry_rebalance").ok());
+    const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (first.AssignedPartitions().size() != 1 && std::chrono::steady_clock::now() < limit) {
+        auto empty = first.Poll(std::chrono::milliseconds(30));
+        ASSERT_TRUE(empty.ok()) << empty.status().ToString();
+        EXPECT_TRUE(empty.value().empty());
+    }
+    ASSERT_EQ(first.AssignedPartitions().size(), 1);
+    ASSERT_EQ(second.AssignedPartitions().size(), 1);
+    auto second_empty = second.Poll(std::chrono::milliseconds(0));
+    ASSERT_TRUE(second_empty.ok()) << second_empty.status().ToString();
+    EXPECT_TRUE(second_empty.value().empty());
+    const auto retained = first.AssignedPartitions().front();
+    // Seek and commit are scoped to the retained Retry partition.
+    ASSERT_TRUE(first.Seek("%RETRY%retry_rebalance", retained, 0).ok());
+    auto replay = first.Poll(std::chrono::milliseconds(0));
+    ASSERT_TRUE(replay.ok());
+    ASSERT_EQ(replay.value().size(), 1);
+    EXPECT_EQ(replay.value().front().topic, "%RETRY%retry_rebalance");
+    EXPECT_EQ(replay.value().front().partition_id, retained);
+    ASSERT_TRUE(first.CommitSync().ok());
+}
+
 TEST(NetworkIntegrationTest, ClientSdkConsumerGroupSplitsAndReassignsPartitions) {
     RunningServer server;
     ClientOptions options;
@@ -399,6 +606,146 @@ TEST(NetworkIntegrationTest, ClientSdkReturnsStatusOnConnectionFailure) {
     auto produced = producer.Send("missing", "k", "v");
     ASSERT_FALSE(produced.ok());
     EXPECT_NE(produced.status().code(), ErrorCode::kOk);
+}
+
+TEST(NetworkIntegrationTest, ClientConnectionReusesSocketForSequentialRequests) {
+    const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(listener, 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(0);
+    ::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
+    ASSERT_EQ(::bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
+    ASSERT_EQ(::listen(listener, 1), 0);
+    socklen_t address_size = sizeof(address);
+    ASSERT_EQ(::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &address_size), 0);
+
+    std::atomic<int> served{0};
+    std::thread server([&] {
+        pollfd event{listener, POLLIN, 0};
+        if (::poll(&event, 1, 1000) <= 0) {
+            ::close(listener);
+            return;
+        }
+        const int fd = ::accept(listener, nullptr, nullptr);
+        ::close(listener);
+        if (fd < 0) {
+            return;
+        }
+        timeval timeout{};
+        timeout.tv_sec = 1;
+        (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        auto read_bytes = [fd](std::byte* data, std::size_t size) {
+            std::size_t received = 0;
+            while (received < size) {
+                const ssize_t count = ::recv(fd, data + received, size - received, 0);
+                if (count < 0 && errno == EINTR) {
+                    continue;
+                }
+                if (count <= 0) {
+                    return false;
+                }
+                received += static_cast<std::size_t>(count);
+            }
+            return true;
+        };
+        for (std::uint64_t id = 1; id <= 2; ++id) {
+            std::array<std::byte, 4> header{};
+            if (!read_bytes(header.data(), header.size())) {
+                break;
+            }
+            const std::uint32_t frame_size = ReadFrameLength(header);
+            if (frame_size < header.size() || frame_size > kMaxFrameBytes) {
+                break;
+            }
+            std::vector<std::byte> body(frame_size - header.size());
+            if (!read_bytes(body.data(), body.size())) {
+                break;
+            }
+            ResponseEnvelope response;
+            response.api_key = ApiKey::kMetadata;
+            response.request_id = id;
+            response.body = MetadataResponse{};
+            auto encoded = EncodeResponse(response);
+            if (!encoded.ok()) {
+                break;
+            }
+            WriteAll(fd, encoded.value());
+            ++served;
+        }
+        ::close(fd);
+    });
+
+    ClientOptions options;
+    options.port = ntohs(address.sin_port);
+    options.request_timeout = std::chrono::milliseconds(500);
+    ClientConnection connection(options);
+    RequestEnvelope request;
+    request.api_key = ApiKey::kMetadata;
+    request.body = MetadataRequest{};
+    request.request_id = 1;
+    auto first = connection.RoundTrip(request);
+    request.request_id = 2;
+    auto second = connection.RoundTrip(request);
+    server.join();
+
+    ASSERT_TRUE(first.ok()) << first.status().ToString();
+    ASSERT_TRUE(second.ok()) << second.status().ToString();
+    EXPECT_EQ(served.load(), 2);
+}
+
+TEST(NetworkIntegrationTest, ServerStopsWithActiveConnections) {
+    for (int attempt = 0; attempt < 10; ++attempt) {
+        auto server = std::make_unique<RunningServer>();
+        std::vector<int> clients;
+        for (int index = 0; index < 8; ++index) {
+            const int fd = Connect(server->port());
+            ASSERT_GE(fd, 0);
+            clients.push_back(fd);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        server.reset();
+        for (int fd : clients) {
+            ::close(fd);
+        }
+    }
+}
+
+TEST(NetworkIntegrationTest, ServerStopsWithPendingConnectionRegistrations) {
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        auto server = std::make_unique<RunningServer>();
+        std::vector<int> clients;
+        for (int index = 0; index < 32; ++index) {
+            const int fd = Connect(server->port());
+            ASSERT_GE(fd, 0);
+            clients.push_back(fd);
+        }
+        server.reset();
+        for (int fd : clients) {
+            ::close(fd);
+        }
+    }
+}
+
+TEST(NetworkIntegrationTest, ServerCanStopBeforeLoopStartsFromAnotherThread) {
+    TempDir temp_dir;
+    BrokerServiceOptions service_options;
+    service_options.storage.data_dir = temp_dir.path();
+    BrokerService service(service_options);
+    TcpServerOptions server_options;
+    server_options.host = "127.0.0.1";
+    server_options.port = 0;
+    TcpServer server(server_options, &service);
+    ASSERT_TRUE(server.Start().ok());
+
+    auto stopped = std::async(std::launch::async, [&] { server.Stop(); });
+    const bool stopped_without_loop =
+        stopped.wait_for(std::chrono::milliseconds(200)) == std::future_status::ready;
+    if (!stopped_without_loop) {
+        server.Loop();
+    }
+    stopped.get();
+    EXPECT_TRUE(stopped_without_loop);
 }
 
 TEST(NetworkIntegrationTest, HandlesStickyFramesOnOneConnection) {

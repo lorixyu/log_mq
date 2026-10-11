@@ -10,6 +10,8 @@
 #include <vector>
 
 #include "logmq/broker/broker_service.h"
+#include "logmq/broker/retry_scheduler.h"
+#include "logmq/storage/file.h"
 
 namespace logmq {
 namespace {
@@ -633,6 +635,376 @@ TEST(BrokerServiceTest, ConcurrentProduceAcrossPartitionsKeepsOffsetsLocal) {
     }
 
     ASSERT_TRUE(service.Close().ok());
+}
+
+RequestEnvelope MakeNack(std::string topic, PartitionId partition, Offset offset,
+                         std::string reason = "handler failed") {
+    RequestEnvelope request;
+    request.api_key = ApiKey::kNack;
+    request.version = kRetryProtocolVersion;
+    request.body = NackRequest{std::move(topic), partition, offset, std::move(reason)};
+    return request;
+}
+
+ResponseEnvelope FetchRetry(BrokerService& broker, std::string topic, Offset offset,
+                            std::chrono::milliseconds timeout = std::chrono::milliseconds(0)) {
+    auto request = MakeFetch(100, std::move(topic), 0, offset);
+    request.version = kRetryProtocolVersion;
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (true) {
+        auto result = broker.Handle(request);
+        if (result.error.error_code != ProtocolErrorCode::kNone ||
+            !std::get<FetchResponse>(result.body).records.empty() ||
+            std::chrono::steady_clock::now() >= deadline) return result;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+}
+
+TEST(BrokerServiceTest, NackDelaysThreeRetriesThenStopsAtDlq) {
+    TempDir temp;
+    BrokerServiceOptions options;
+    options.storage.data_dir = temp.path();
+    options.retry.delay = std::chrono::milliseconds(80);
+    BrokerService broker(options);
+    ASSERT_TRUE(broker.Start().ok());
+    ASSERT_EQ(broker.Handle(MakeCreateTopic(1, "orders", 1)).error.error_code,
+              ProtocolErrorCode::kNone);
+    ProduceRequest batch{"orders", 0, {{100, "first", "one"}, {101, "second", "two"}}};
+    RequestEnvelope produce;
+    produce.body = batch;
+    ASSERT_EQ(broker.Handle(produce).error.error_code, ProtocolErrorCode::kNone);
+    std::string source = "orders";
+    Offset source_offset = 1;
+    for (std::uint32_t count = 1; count <= 4; ++count) {
+        auto result = broker.Handle(MakeNack(source, 0, source_offset));
+        ASSERT_EQ(result.error.error_code, ProtocolErrorCode::kNone) << result.error.message;
+        const auto& nack = std::get<NackResponse>(result.body);
+        EXPECT_EQ(nack.retry.retry_count, count);
+        EXPECT_EQ(nack.retry.original_topic, "orders");
+        EXPECT_EQ(nack.retry.original_offset, 1);
+        EXPECT_EQ(nack.dead_letter, count == 4);
+        EXPECT_EQ(nack.topic, count == 4 ? "%DLQ%orders" : "%RETRY%orders");
+        if (count < 4) {
+            auto early = FetchRetry(broker, nack.topic, nack.offset);
+            ASSERT_EQ(early.error.error_code, ProtocolErrorCode::kNone);
+            EXPECT_TRUE(std::get<FetchResponse>(early.body).records.empty());
+            EXPECT_EQ(std::get<FetchResponse>(early.body).high_watermark, nack.offset);
+        }
+        auto fetched = FetchRetry(broker, nack.topic, nack.offset, std::chrono::seconds(2));
+        ASSERT_EQ(fetched.error.error_code, ProtocolErrorCode::kNone);
+        const auto& records = std::get<FetchResponse>(fetched.body).records;
+        ASSERT_EQ(records.size(), 1);
+        EXPECT_EQ(records[0].key, "second");
+        EXPECT_EQ(records[0].value, "two");
+        EXPECT_EQ(records[0].timestamp, 101);
+        ASSERT_TRUE(records[0].retry);
+        EXPECT_EQ(records[0].retry->retry_count, count);
+        source = nack.topic;
+        source_offset = nack.offset;
+    }
+    EXPECT_EQ(broker.Handle(MakeNack(source, 0, source_offset)).error.error_code,
+              ProtocolErrorCode::kInvalidRequest);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    auto retry_end = FetchRetry(broker, "%RETRY%orders", 3);
+    EXPECT_TRUE(std::get<FetchResponse>(retry_end.body).records.empty());
+    EXPECT_EQ(std::get<FetchResponse>(retry_end.body).high_watermark, 3);
+}
+
+TEST(BrokerServiceTest, NackValidatesLocationsAndReservesInternalTopics) {
+    TempDir temp;
+    BrokerServiceOptions options;
+    options.storage.data_dir = temp.path();
+    BrokerService broker(options);
+    ASSERT_TRUE(broker.Start().ok());
+    ASSERT_EQ(broker.Handle(MakeCreateTopic(1, "orders", 1)).error.error_code,
+              ProtocolErrorCode::kNone);
+    ASSERT_EQ(broker.Handle(MakeProduce(2, "orders", 0, "k", "v")).error.error_code,
+              ProtocolErrorCode::kNone);
+    EXPECT_EQ(broker.Handle(MakeNack("orders", 0, -1)).error.error_code,
+              ProtocolErrorCode::kOffsetOutOfRange);
+    EXPECT_EQ(broker.Handle(MakeNack("orders", 0, 1)).error.error_code,
+              ProtocolErrorCode::kOffsetOutOfRange);
+    EXPECT_EQ(broker.Handle(MakeNack("orders", 2, 0)).error.error_code,
+              ProtocolErrorCode::kTopicNotFound);
+    EXPECT_EQ(broker.Handle(MakeNack("missing", 0, 0)).error.error_code,
+              ProtocolErrorCode::kTopicNotFound);
+    EXPECT_EQ(broker.Handle(MakeCreateTopic(3, "%RETRY%orders", 1)).error.error_code,
+              ProtocolErrorCode::kInvalidRequest);
+    EXPECT_EQ(broker.Handle(MakeProduce(4, "%RETRY%orders", 0, "k", "v")).error.error_code,
+              ProtocolErrorCode::kInvalidRequest);
+    auto wrong = MakeNack("orders", 0, 0);
+    wrong.body = FetchRequest{};
+    EXPECT_EQ(broker.Handle(wrong).error.error_code, ProtocolErrorCode::kInvalidRequest);
+}
+
+TEST(BrokerServiceTest, PendingLargeRetryRecoversWithCountAndDeadline) {
+    TempDir temp;
+    BrokerServiceOptions options;
+    options.storage.data_dir = temp.path();
+    options.retry.delay = std::chrono::milliseconds(300);
+    std::uint64_t deadline = 0;
+    {
+        BrokerService broker(options);
+        ASSERT_TRUE(broker.Start().ok());
+        ASSERT_EQ(broker.Handle(MakeCreateTopic(1, "orders", 1)).error.error_code,
+                  ProtocolErrorCode::kNone);
+        ASSERT_EQ(broker.Handle(MakeProduce(2, "orders", 0, "k", std::string(8192, 'x')))
+                      .error.error_code, ProtocolErrorCode::kNone);
+        auto nack = broker.Handle(MakeNack("orders", 0, 0));
+        ASSERT_EQ(nack.error.error_code, ProtocolErrorCode::kNone);
+        deadline = std::get<NackResponse>(nack.body).retry.next_visible_time;
+        ASSERT_TRUE(broker.Close().ok());
+    }
+    BrokerService broker(options);
+    ASSERT_TRUE(broker.Start().ok());
+    auto request = MakeFetch(3, "%RETRY%orders", 0, 0);
+    request.version = kRetryProtocolVersion;
+    std::get<FetchRequest>(request.body).max_bytes = 20000;
+    auto first = broker.Handle(request);
+    ASSERT_EQ(first.error.error_code, ProtocolErrorCode::kNone);
+    const auto now = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+    if (now < deadline) EXPECT_TRUE(std::get<FetchResponse>(first.body).records.empty());
+    const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::get<FetchResponse>(first.body).records.empty() &&
+           std::chrono::steady_clock::now() < limit) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        first = broker.Handle(request);
+        ASSERT_EQ(first.error.error_code, ProtocolErrorCode::kNone);
+    }
+    const auto& records = std::get<FetchResponse>(first.body).records;
+    ASSERT_EQ(records.size(), 1);
+    EXPECT_EQ(records[0].value, std::string(8192, 'x'));
+    ASSERT_TRUE(records[0].retry);
+    EXPECT_EQ(records[0].retry->retry_count, 1);
+    EXPECT_EQ(records[0].retry->next_visible_time, deadline);
+    auto nack = broker.Handle(MakeNack("%RETRY%orders", 0, 0));
+    ASSERT_EQ(nack.error.error_code, ProtocolErrorCode::kNone);
+    EXPECT_EQ(std::get<NackResponse>(nack.body).retry.retry_count, 2);
+}
+
+TEST(BrokerServiceTest, InternalTopicOffsetsPersistAcrossBrokerRestart) {
+    TempDir temp;
+    BrokerServiceOptions options;
+    options.storage.data_dir = temp.path();
+    options.retry.delay = std::chrono::milliseconds(0);
+    {
+        BrokerService broker(options);
+        ASSERT_TRUE(broker.Start().ok());
+        ASSERT_EQ(broker.Handle(MakeCreateTopic(1, "offsets", 1)).error.error_code,
+                  ProtocolErrorCode::kNone);
+        ASSERT_EQ(broker.Handle(MakeProduce(2, "offsets", 0, "k", "v")).error.error_code,
+                  ProtocolErrorCode::kNone);
+        ASSERT_EQ(broker.Handle(MakeNack("offsets", 0, 0)).error.error_code,
+                  ProtocolErrorCode::kNone);
+        auto committed = broker.Handle(MakeCommitOffset(3, "group", "%RETRY%offsets", 0, 1));
+        ASSERT_EQ(committed.error.error_code, ProtocolErrorCode::kNone) << committed.error.message;
+        ASSERT_TRUE(broker.Close().ok());
+    }
+    BrokerService recovered(options);
+    ASSERT_TRUE(recovered.Start().ok());
+    auto fetched = recovered.Handle(MakeFetchCommittedOffset(4, "group", "%RETRY%offsets", 0));
+    ASSERT_EQ(fetched.error.error_code, ProtocolErrorCode::kNone) << fetched.error.message;
+    const auto& offset = std::get<FetchCommittedOffsetResponse>(fetched.body);
+    EXPECT_TRUE(offset.committed);
+    EXPECT_EQ(offset.offset, 1);
+}
+
+TEST(BrokerServiceTest, RetryFetchUsesOriginalPayloadByteBudget) {
+    TempDir temp;
+    BrokerServiceOptions options;
+    options.storage.data_dir = temp.path();
+    options.retry.delay = std::chrono::milliseconds(0);
+    BrokerService broker(options);
+    ASSERT_TRUE(broker.Start().ok());
+    ASSERT_EQ(broker.Handle(MakeCreateTopic(1, "budget", 1)).error.error_code,
+              ProtocolErrorCode::kNone);
+    const std::string key(3900, 'k');
+    ASSERT_EQ(broker.Handle(MakeProduce(2, "budget", 0, key, "value")).error.error_code,
+              ProtocolErrorCode::kNone);
+    ASSERT_EQ(broker.Handle(MakeFetch(3, "budget", 0, 0)).error.error_code,
+              ProtocolErrorCode::kNone);
+    ASSERT_EQ(broker.Handle(MakeNack("budget", 0, 0, std::string(2000, 'r'))).error.error_code,
+              ProtocolErrorCode::kNone);
+    auto fetched = FetchRetry(broker, "%RETRY%budget", 0);
+    ASSERT_EQ(fetched.error.error_code, ProtocolErrorCode::kNone) << fetched.error.message;
+    ASSERT_EQ(std::get<FetchResponse>(fetched.body).records.size(), 1);
+    EXPECT_EQ(std::get<FetchResponse>(fetched.body).records.front().key, key);
+    auto too_small = MakeFetch(4, "%RETRY%budget", 0, 0);
+    std::get<FetchRequest>(too_small.body).max_bytes = 100;
+    EXPECT_EQ(broker.Handle(too_small).error.error_code, ProtocolErrorCode::kInvalidRequest);
+}
+
+TEST(BrokerServiceTest, CorruptInternalEnvelopeFailsStartup) {
+    TempDir temp;
+    TopicManager topics(TopicManagerOptions{temp.path()});
+    ASSERT_TRUE(topics.Load().ok());
+    ASSERT_TRUE(topics.CreateTopic("orders", 1).ok());
+    ASSERT_TRUE(topics.CreateTopic("%RETRY%orders", 1).ok());
+    auto partition = topics.GetPartition("%RETRY%orders", 0);
+    ASSERT_TRUE(partition.ok());
+    ASSERT_TRUE(partition.value()->log.Append({Record{1, "k", "not a retry envelope"}}).ok());
+    ASSERT_TRUE(topics.Close().ok());
+    BrokerServiceOptions options;
+    options.storage.data_dir = temp.path();
+    BrokerService broker(options);
+    EXPECT_FALSE(broker.Start().ok());
+}
+
+TEST(BrokerServiceTest, InternalCrcCorruptionFailsStartupWithoutTruncatingData) {
+    for (const std::string prefix : {"%RETRY%", "%DLQ%"}) {
+        for (bool rolled : {false, true}) {
+            SCOPED_TRACE(prefix + (rolled ? " sealed segment" : " active segment"));
+            TempDir temp;
+            TopicManager topics(TopicManagerOptions{temp.path(),
+                rolled ? kRecordBatchHeaderBytes : 1024U * 1024});
+            ASSERT_TRUE(topics.Load().ok());
+            ASSERT_TRUE(topics.CreateTopic("orders", 1).ok());
+            ASSERT_TRUE(topics.CreateTopic(prefix + "orders", 1).ok());
+            auto partition = topics.GetPartition(prefix + "orders", 0);
+            ASSERT_TRUE(partition.ok());
+            ProtocolRecord record{100, "key", "value"};
+            record.retry = RetryMetadata{prefix == "%RETRY%" ? 1U : 4U,
+                prefix == "%RETRY%" ? RetryNowMs() : 0, "orders", "failed", 0, 0};
+            auto encoded = EncodeRetryRecord(record);
+            ASSERT_TRUE(encoded.ok());
+            auto first = partition.value()->log.Append({encoded.value()});
+            ASSERT_TRUE(first.ok());
+            ASSERT_TRUE(partition.value()->log.Append({encoded.value()}).ok());
+            ASSERT_TRUE(topics.Close().ok());
+
+            const auto path = first.value().segment_path;
+            const auto size = std::filesystem::file_size(path);
+            auto file = File::Open(path, O_RDWR);
+            ASSERT_TRUE(file.ok());
+            std::array<std::byte, 1> byte{};
+            auto read = file.value().PRead(byte, size - 1);
+            ASSERT_TRUE(read.ok());
+            ASSERT_EQ(read.value(), 1U);
+            byte[0] ^= std::byte{1};
+            ASSERT_TRUE(file.value().PWrite(byte, size - 1).ok());
+            ASSERT_TRUE(file.value().Fsync().ok());
+            ASSERT_TRUE(file.value().Close().ok());
+
+            BrokerServiceOptions options;
+            options.storage.data_dir = temp.path();
+            BrokerService broker(options);
+            const auto status = broker.Start();
+            EXPECT_EQ(status.code(), ErrorCode::kCorruption) << status.ToString();
+            EXPECT_EQ(std::filesystem::file_size(path), size);
+        }
+    }
+}
+
+TEST(BrokerServiceTest, InternalRecoveryTruncatesOnlyIncompleteActiveTail) {
+    for (const std::string prefix : {"%RETRY%", "%DLQ%"}) {
+        for (bool partial_header : {false, true}) {
+            SCOPED_TRACE(prefix + (partial_header ? " partial header" : " partial payload"));
+            TempDir temp;
+            TopicManager topics(TopicManagerOptions{temp.path()});
+            ASSERT_TRUE(topics.Load().ok());
+            ASSERT_TRUE(topics.CreateTopic("orders", 1).ok());
+            ASSERT_TRUE(topics.CreateTopic(prefix + "orders", 1).ok());
+            auto partition = topics.GetPartition(prefix + "orders", 0);
+            ASSERT_TRUE(partition.ok());
+            ProtocolRecord record{100, "key", "value"};
+            record.retry = RetryMetadata{prefix == "%RETRY%" ? 1U : 4U,
+                prefix == "%RETRY%" ? RetryNowMs() : 0, "orders", "failed", 0, 0};
+            auto encoded = EncodeRetryRecord(record);
+            ASSERT_TRUE(encoded.ok());
+            ASSERT_TRUE(partition.value()->log.Append({encoded.value()}).ok());
+            auto second = partition.value()->log.Append({encoded.value()});
+            ASSERT_TRUE(second.ok());
+            ASSERT_TRUE(topics.Close().ok());
+            const auto path = second.value().segment_path;
+            const auto partial_size = partial_header ? second.value().position + 10
+                                                    : std::filesystem::file_size(path) - 7;
+            std::filesystem::resize_file(path, partial_size);
+
+            BrokerServiceOptions options;
+            options.storage.data_dir = temp.path();
+            BrokerService broker(options);
+            const auto status = broker.Start();
+            ASSERT_TRUE(status.ok()) << status.ToString();
+            auto fetched = FetchRetry(broker, prefix + "orders", 0);
+            ASSERT_EQ(fetched.error.error_code, ProtocolErrorCode::kNone);
+            const auto& body = std::get<FetchResponse>(fetched.body);
+            ASSERT_EQ(body.records.size(), 1U);
+            EXPECT_EQ(body.records.front().value, "value");
+            EXPECT_EQ(body.high_watermark, 1);
+            EXPECT_EQ(std::filesystem::file_size(path), second.value().position);
+        }
+    }
+}
+
+TEST(BrokerServiceTest, InternalIncompleteSealedSegmentFailsWithoutTruncation) {
+    TempDir temp;
+    TopicManager topics(TopicManagerOptions{temp.path(), kRecordBatchHeaderBytes});
+    ASSERT_TRUE(topics.Load().ok());
+    ASSERT_TRUE(topics.CreateTopic("orders", 1).ok());
+    ASSERT_TRUE(topics.CreateTopic("%RETRY%orders", 1).ok());
+    auto partition = topics.GetPartition("%RETRY%orders", 0);
+    ASSERT_TRUE(partition.ok());
+    ProtocolRecord record{100, "key", "value"};
+    record.retry = RetryMetadata{1, RetryNowMs(), "orders", "failed", 0, 0};
+    auto encoded = EncodeRetryRecord(record);
+    ASSERT_TRUE(encoded.ok());
+    auto first = partition.value()->log.Append({encoded.value()});
+    ASSERT_TRUE(first.ok());
+    ASSERT_TRUE(partition.value()->log.Append({encoded.value()}).ok());
+    ASSERT_TRUE(topics.Close().ok());
+    const auto path = first.value().segment_path;
+    const auto partial_size = std::filesystem::file_size(path) - 7;
+    std::filesystem::resize_file(path, partial_size);
+
+    BrokerServiceOptions options;
+    options.storage.data_dir = temp.path();
+    BrokerService broker(options);
+    EXPECT_FALSE(broker.Start().ok());
+    EXPECT_EQ(std::filesystem::file_size(path), partial_size);
+}
+
+TEST(RetrySchedulerTest, OutOfOrderDeadlinesPreserveContiguousVisibility) {
+    TempDir temp;
+    TopicManager topics(TopicManagerOptions{temp.path()});
+    ASSERT_TRUE(topics.Load().ok());
+    RetryScheduler scheduler(topics);
+    ASSERT_TRUE(scheduler.Start().ok());
+    const auto now = RetryNowMs();
+    scheduler.Schedule("%RETRY%orders", 0, 0, now + 120);
+    scheduler.Schedule("%RETRY%orders", 0, 1, now + 20);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_EQ(scheduler.VisibleEnd("%RETRY%orders", 0), 0);
+    const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (scheduler.VisibleEnd("%RETRY%orders", 0) != 2 &&
+           std::chrono::steady_clock::now() < limit) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_EQ(scheduler.VisibleEnd("%RETRY%orders", 0), 2);
+    scheduler.Close();
+}
+
+TEST(BrokerServiceTest, ConcurrentNacksDoNotLeaveVisibilityHoles) {
+    TempDir temp;
+    BrokerServiceOptions options;
+    options.storage.data_dir = temp.path();
+    options.retry.delay = std::chrono::milliseconds(30);
+    BrokerService broker(options);
+    ASSERT_TRUE(broker.Start().ok());
+    ASSERT_EQ(broker.Handle(MakeCreateTopic(1, "orders", 1)).error.error_code,
+              ProtocolErrorCode::kNone);
+    ASSERT_EQ(broker.Handle(MakeProduce(2, "orders", 0, "k", "v")).error.error_code,
+              ProtocolErrorCode::kNone);
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 8; ++i) threads.emplace_back([&] {
+        EXPECT_EQ(broker.Handle(MakeNack("orders", 0, 0)).error.error_code,
+                  ProtocolErrorCode::kNone);
+    });
+    for (auto& thread : threads) thread.join();
+    auto last = FetchRetry(broker, "%RETRY%orders", 7, std::chrono::seconds(2));
+    ASSERT_EQ(last.error.error_code, ProtocolErrorCode::kNone);
+    EXPECT_EQ(std::get<FetchResponse>(last.body).high_watermark, 8);
+    ASSERT_EQ(std::get<FetchResponse>(last.body).records.size(), 1);
 }
 
 }  // namespace

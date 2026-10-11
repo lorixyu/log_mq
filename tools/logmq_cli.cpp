@@ -33,6 +33,7 @@ void PrintUsage() {
               << "  leave-group --group GROUP --member MEMBER\n";
 }
 
+// 读取第 index 个参数
 std::string ReadArg(int& index, int argc, char** argv) {
     if (index + 1 >= argc) {
         throw std::runtime_error(std::string("missing value for ") + argv[index]);
@@ -41,6 +42,7 @@ std::string ReadArg(int& index, int argc, char** argv) {
     return argv[index];
 }
 
+// 解析并获取CLI参数
 CliOptions ParseGlobalOptions(int argc, char** argv) {
     CliOptions options;
     int i = 1;
@@ -60,6 +62,7 @@ CliOptions ParseGlobalOptions(int argc, char** argv) {
     throw std::runtime_error("missing command");
 }
 
+// 返回查找命令name的value
 std::string OptionValue(int argc, char** argv, int start, std::string_view name,
                         std::string default_value = "") {
     for (int i = start + 1; i < argc; ++i) {
@@ -72,7 +75,7 @@ std::string OptionValue(int argc, char** argv, int start, std::string_view name,
     }
     return default_value;
 }
-
+// 返回name命令的value
 std::string RequiredOption(int argc, char** argv, int start, std::string_view name) {
     std::string value = OptionValue(argc, argv, start, name);
     if (value.empty()) {
@@ -86,7 +89,7 @@ std::uint64_t NowTimestamp() {
     return static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
 }
-
+// cli的option 转为 client 的 option
 logmq::ClientOptions ToClientOptions(const CliOptions& options) {
     logmq::ClientOptions client;
     client.host = options.host;
@@ -209,6 +212,13 @@ int PrintResponse(const logmq::ResponseEnvelope& response) {
     }
 
     switch (response.api_key) {
+        case logmq::ApiKey::kNack: {
+            const auto& body = std::get<logmq::NackResponse>(response.body);
+            std::cout << "topic=" << body.topic << " partition=" << body.partition_id
+                      << " offset=" << body.offset << " retry_count=" << body.retry.retry_count
+                      << " dead_letter=" << (body.dead_letter ? "true" : "false") << "\n";
+            return 0;
+        }
         case logmq::ApiKey::kCreateTopic: {
             const auto& body = std::get<logmq::CreateTopicResponse>(response.body);
             std::cout << "created topic=" << body.topic << " partitions="

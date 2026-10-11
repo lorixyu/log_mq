@@ -20,6 +20,7 @@ add_library(logmq_core
     src/broker/broker_service.cpp
     src/broker/group_coordinator.cpp
     src/broker/offset_store.cpp
+    src/broker/retry_scheduler.cpp
     src/broker/topic_manager.cpp
     src/client/client.cpp
     src/net/buffer.cpp

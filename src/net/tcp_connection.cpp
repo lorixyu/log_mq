@@ -119,10 +119,11 @@ void TcpConnection::HandleClose() {
     channel_.Remove();
     const int closed_fd = fd_;
     fd_ = -1;
-    ::close(closed_fd);
     if (close_callback_) {
         close_callback_(closed_fd);
     }
+    // Remove the old map entry before the OS can reuse this fd for a new client.
+    ::close(closed_fd);
 }
 
 void TcpConnection::SubmitNext() {

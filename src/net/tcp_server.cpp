@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
+#include <future>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -71,34 +72,63 @@ Status TcpServer::Start() {
     return Status::Ok();
 }
 
-void TcpServer::Loop() { main_loop_.Loop(); }
+void TcpServer::Loop() {
+    {
+        std::lock_guard lock(connections_mutex_);
+        if (stopping_) {
+            return;
+        }
+        loop_running_ = true;
+    }
+    main_loop_.Loop();
+    {
+        std::lock_guard lock(connections_mutex_);
+        loop_running_ = false;
+    }
+}
 
 void TcpServer::Stop() {
-    main_loop_.RunInLoop([this] {
-        if (accept_channel_) {
-            accept_channel_->DisableAll();
-            accept_channel_->Remove();
-            accept_channel_.reset();
-        }
-        std::vector<std::shared_ptr<TcpConnection>> connections;
+    std::call_once(stop_once_, [this] {
+        bool loop_running = false;
         {
             std::lock_guard lock(connections_mutex_);
-            // Copy shared_ptrs out of the map before calling Shutdown(); close
-            // callbacks may erase entries from the same map.
-            connections.reserve(connections_.size());
-            for (auto& [_, connection] : connections_) {
-                connections.push_back(connection);
+            stopping_ = true;
+            loop_running = loop_running_;
+        }
+        std::promise<void> shutdown_queued;
+        auto ready = shutdown_queued.get_future();
+        auto shutdown = [this, &shutdown_queued] {
+            if (accept_channel_) {
+                accept_channel_->DisableAll();
+                accept_channel_->Remove();
+                accept_channel_.reset();
             }
-            connections_.clear();
+            std::vector<std::shared_ptr<TcpConnection>> connections;
+            {
+                std::lock_guard lock(connections_mutex_);
+                connections.reserve(connections_.size());
+                for (auto& [_, connection] : connections_) {
+                    connections.push_back(connection);
+                }
+                connections_.clear();
+            }
+            for (auto& connection : connections) {
+                connection->Shutdown();
+            }
+            CloseFd(listen_fd_);
+            shutdown_queued.set_value();
+        };
+        if (loop_running) {
+            main_loop_.RunInLoop(shutdown);
+        } else {
+            shutdown();
         }
-        for (auto& connection : connections) {
-            connection->Shutdown();
-        }
-        CloseFd(listen_fd_);
+        ready.wait();
+        main_loop_.Quit();
+        // Workers may queue responses to IO loops; finish them before destroying the loops.
+        workers_.Stop();
+        io_loops_.Stop();
     });
-    main_loop_.Quit();
-    io_loops_.Stop();
-    workers_.Stop();
 }
 
 std::uint16_t TcpServer::bound_port() const { return bound_port_; }
@@ -161,7 +191,12 @@ void TcpServer::HandleAccept() {
             return;
         }
 
-        if (connections_.size() >= options_.max_connections) {
+        bool reject = false;
+        {
+            std::lock_guard lock(connections_mutex_);
+            reject = stopping_ || connections_.size() >= options_.max_connections;
+        }
+        if (reject) {
             ::close(fd);
             continue;
         }
@@ -181,12 +216,18 @@ void TcpServer::HandleAccept() {
 
         // MainReactor accepts; a SubReactor owns the connection from creation on.
         io_loop->QueueInLoop([this, io_loop, fd] {
-            auto connection = std::make_shared<TcpConnection>(
-                io_loop, fd, service_, &workers_, options_.read_buffer_bytes);
-            connection->SetCloseCallback([this](int closed_fd) { RemoveConnection(closed_fd); });
-            connection->Tie();
+            std::shared_ptr<TcpConnection> connection;
             {
                 std::lock_guard lock(connections_mutex_);
+                if (stopping_) {
+                    ::close(fd);
+                    return;
+                }
+                connection = std::make_shared<TcpConnection>(
+                    io_loop, fd, service_, &workers_, options_.read_buffer_bytes);
+                connection->SetCloseCallback(
+                    [this](int closed_fd) { RemoveConnection(closed_fd); });
+                connection->Tie();
                 connections_.emplace(fd, connection);
             }
             connection->Start();

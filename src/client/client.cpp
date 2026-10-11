@@ -17,6 +17,7 @@
 #include <arpa/inet.h>
 
 #include "logmq/protocol/codec.h"
+#include "logmq/broker/retry_scheduler.h"
 
 namespace logmq {
 namespace {
@@ -83,7 +84,12 @@ Result<int> Connect(const ClientOptions& options) {
 Status WriteAll(int fd, std::span<const std::byte> bytes) {
     std::size_t written = 0;
     while (written < bytes.size()) {
-        const ssize_t n = ::send(fd, bytes.data() + written, bytes.size() - written, 0);
+#ifdef MSG_NOSIGNAL
+        constexpr int kSendFlags = MSG_NOSIGNAL;
+#else
+        constexpr int kSendFlags = 0;
+#endif
+        const ssize_t n = ::send(fd, bytes.data() + written, bytes.size() - written, kSendFlags);
         if (n < 0) {
             if (errno == EINTR) {
                 continue;
@@ -92,6 +98,9 @@ Status WriteAll(int fd, std::span<const std::byte> bytes) {
                 return Status::Timeout("send: " + std::string(std::strerror(errno)));
             }
             return Status::IoError("send: " + std::string(std::strerror(errno)));
+        }
+        if (n == 0) {
+            return Status::IoError("send: connection closed");
         }
         written += static_cast<std::size_t>(n);
     }
@@ -167,46 +176,68 @@ Result<Response> TypedResponse(Result<ResponseEnvelope> envelope,
 
 ClientConnection::ClientConnection(ClientOptions options) : options_(std::move(options)) {}
 
+ClientConnection::~ClientConnection() { Disconnect(); }
+
+void ClientConnection::Disconnect() const {
+    if (fd_ >= 0) {
+        ::close(fd_);
+        fd_ = -1;
+    }
+}
+
 Result<ResponseEnvelope> ClientConnection::RoundTrip(const RequestEnvelope& request) const {
     auto encoded = EncodeRequest(request);
     if (!encoded.ok()) {
         return encoded.status();
     }
 
-    auto fd = Connect(options_);
-    if (!fd.ok()) {
-        return fd.status();
+    std::lock_guard lock(mutex_);
+    if (fd_ < 0) {
+        auto connected = Connect(options_);
+        if (!connected.ok()) {
+            return connected.status();
+        }
+        fd_ = connected.value();
     }
 
-    Status status = WriteAll(fd.value(), std::span<const std::byte>(encoded.value().data(),
-                                                                    encoded.value().size()));
+    Status status = WriteAll(fd_, std::span<const std::byte>(encoded.value().data(),
+                                                            encoded.value().size()));
     if (!status.ok()) {
-        ::close(fd.value());
+        Disconnect();
         return status;
     }
 
     std::array<std::byte, 4> header{};
-    status = ReadExact(fd.value(), header.data(), header.size());
+    status = ReadExact(fd_, header.data(), header.size());
     if (!status.ok()) {
-        ::close(fd.value());
+        Disconnect();
         return status;
     }
 
     const std::uint32_t frame_len = ReadFrameLength(header);
     if (frame_len < kFrameHeaderBytes || frame_len > kMaxFrameBytes) {
-        ::close(fd.value());
+        Disconnect();
         return Status::InvalidArgument("invalid response frame length");
     }
 
     std::vector<std::byte> frame(frame_len);
     std::copy(header.begin(), header.end(), frame.begin());
-    status = ReadExact(fd.value(), frame.data() + header.size(), frame.size() - header.size());
-    ::close(fd.value());
+    status = ReadExact(fd_, frame.data() + header.size(), frame.size() - header.size());
     if (!status.ok()) {
+        Disconnect();
         return status;
     }
 
-    return DecodeResponse(std::span<const std::byte>(frame.data(), frame.size()));
+    auto decoded = DecodeResponse(std::span<const std::byte>(frame.data(), frame.size()));
+    if (!decoded.ok() || decoded.value().request_id != request.request_id ||
+        decoded.value().api_key != request.api_key) {
+        Disconnect();
+        if (!decoded.ok()) {
+            return decoded.status();
+        }
+        return Status::Internal("response does not match request");
+    }
+    return decoded;
 }
 
 AdminClient::AdminClient(ClientOptions options) : connection_(std::move(options)) {}
@@ -296,12 +327,36 @@ Result<void> Consumer::Subscribe(TopicName topic) {
         return Status::NotFound("topic not found");
     }
 
+    std::string previous_member;
+    {
+        std::lock_guard lock(mutex_);
+        if (closed_) return Status::InvalidArgument("consumer is closed");
+        if (topic != topic_ && !member_id_.empty()) {
+            previous_member = member_id_;
+            heartbeat_stop_ = true;
+        }
+    }
+    if (!previous_member.empty()) {
+        heartbeat_condition_.notify_all();
+        if (heartbeat_thread_.joinable()) heartbeat_thread_.join();
+        auto left = SendLeaveGroup(previous_member);
+        if (!left.ok() && left.status().code() != ErrorCode::kNotFound) {
+            StartHeartbeat();
+            return left.status();
+        }
+        std::lock_guard lock(mutex_);
+        member_id_.clear();
+        generation_id_ = 0;
+        subscribed_ = false;
+    }
+
     {
         std::lock_guard lock(mutex_);
         if (closed_) {
             return Status::InvalidArgument("consumer is closed");
         }
         topic_ = std::move(topic);
+        subscribed_ = false;
         assignments_.clear();
         needs_rejoin_ = false;
     }
@@ -338,52 +393,49 @@ Result<std::vector<ConsumerRecord>> Consumer::Poll(std::chrono::milliseconds tim
 
         TopicName topic;
         std::vector<Assignment> assignments;
+        std::int32_t generation;
         {
             std::lock_guard lock(mutex_);
             topic = topic_;
             assignments = assignments_;
+            generation = generation_id_;
         }
 
         for (Assignment& assignment : assignments) {
-            RequestEnvelope envelope;
-            envelope.api_key = ApiKey::kFetch;
-            envelope.version = kProtocolVersion;
-            envelope.request_id = NextRequestId();
-            envelope.body.emplace<FetchRequest>(
-                FetchRequest{topic, assignment.partition_id,
-                             assignment.next_offset, options_.max_bytes});
-
-            auto fetch = TypedResponse<FetchResponse>(connection_.RoundTrip(envelope),
-                                                      ApiKey::kFetch, "fetch");
-            if (!fetch.ok()) {
-                return fetch.status();
-            }
-
-            Offset next_offset = assignment.next_offset;
-            for (std::size_t i = 0; i < fetch.value().records.size(); ++i) {
-                const ProtocolRecord& record = fetch.value().records[i];
-                const Offset offset = fetch.value().base_offset + static_cast<Offset>(i);
-                if (offset < assignment.next_offset) {
-                    continue;
+            const int sources = IsInternalTopic(topic) ? 1 : 2;
+            for (int source = 0; source < sources; ++source) {
+                const TopicName fetch_topic = source == 0 ? topic : std::string(kRetryTopicPrefix) + topic;
+                Offset& next_offset = source == 0 ? assignment.next_offset : assignment.retry_next_offset;
+                RequestEnvelope envelope;
+                envelope.api_key = ApiKey::kFetch;
+                envelope.version = IsInternalTopic(fetch_topic) ? kRetryProtocolVersion : kProtocolVersion;
+                envelope.request_id = NextRequestId();
+                envelope.body = FetchRequest{fetch_topic, assignment.partition_id,
+                                            next_offset, options_.max_bytes};
+                auto response = connection_.RoundTrip(envelope);
+                if (source == 1 && response.ok() &&
+                    response.value().error.error_code == ProtocolErrorCode::kTopicNotFound) continue;
+                auto fetch = TypedResponse<FetchResponse>(std::move(response), ApiKey::kFetch, "fetch");
+                if (!fetch.ok()) return fetch.status();
+                for (std::size_t i = 0; i < fetch.value().records.size(); ++i) {
+                    const ProtocolRecord& record = fetch.value().records[i];
+                    const Offset offset = fetch.value().base_offset + static_cast<Offset>(i);
+                    if (offset < next_offset) continue;
+                    output.push_back(ConsumerRecord{fetch_topic, assignment.partition_id, offset,
+                        record.timestamp, record.key, record.value, record.retry});
+                    next_offset = offset + 1;
                 }
-                output.push_back(ConsumerRecord{topic,
-                                                assignment.partition_id,
-                                                offset,
-                                                record.timestamp,
-                                                record.key,
-                                                record.value});
-                next_offset = offset + 1;
             }
-            assignment.next_offset = next_offset;
         }
 
         {
             std::lock_guard lock(mutex_);
-            if (topic == topic_) {
+            if (topic == topic_ && generation == generation_id_) {
                 for (const Assignment& updated : assignments) {
                     for (Assignment& current : assignments_) {
                         if (current.partition_id == updated.partition_id) {
                             current.next_offset = updated.next_offset;
+                            current.retry_next_offset = updated.retry_next_offset;
                             break;
                         }
                     }
@@ -400,17 +452,47 @@ Result<std::vector<ConsumerRecord>> Consumer::Poll(std::chrono::milliseconds tim
 }
 
 Result<void> Consumer::Seek(PartitionId partition_id, Offset offset) {
+    TopicName topic;
+    {
+        std::lock_guard lock(mutex_);
+        topic = topic_;
+    }
+    return Seek(topic, partition_id, offset);
+}
+
+Result<void> Consumer::Seek(const TopicName& topic, PartitionId partition_id, Offset offset) {
     if (offset < 0) {
         return Status::InvalidArgument("seek offset must not be negative");
     }
     std::lock_guard lock(mutex_);
+    if (closed_ || !subscribed_) return Status::InvalidArgument("consumer is not subscribed or is closed");
+    const bool retry = !IsInternalTopic(topic_) && topic == std::string(kRetryTopicPrefix) + topic_;
+    if (topic != topic_ && !retry) return Status::InvalidArgument("topic is not subscribed");
     for (Assignment& assignment : assignments_) {
         if (assignment.partition_id == partition_id) {
-            assignment.next_offset = offset;
+            (retry ? assignment.retry_next_offset : assignment.next_offset) = offset;
             return {};
         }
     }
     return Status::NotFound("partition is not assigned");
+}
+
+Result<NackResponse> Consumer::Nack(const ConsumerRecord& record, std::string reason) {
+    {
+        std::lock_guard lock(mutex_);
+        if (closed_ || !subscribed_) return Status::InvalidArgument("consumer is not subscribed or is closed");
+        const bool retry = !IsInternalTopic(topic_) && record.topic == std::string(kRetryTopicPrefix) + topic_;
+        if (record.topic != topic_ && !retry) return Status::InvalidArgument("record topic is not subscribed");
+        if (std::none_of(assignments_.begin(), assignments_.end(), [&](const Assignment& assignment) {
+                return assignment.partition_id == record.partition_id;
+            })) return Status::InvalidArgument("record partition is not assigned");
+    }
+    RequestEnvelope request;
+    request.api_key = ApiKey::kNack;
+    request.version = kRetryProtocolVersion;
+    request.request_id = NextRequestId();
+    request.body = NackRequest{record.topic, record.partition_id, record.offset, std::move(reason)};
+    return TypedResponse<NackResponse>(connection_.RoundTrip(request), ApiKey::kNack, "nack");
 }
 
 Result<void> Consumer::CommitSync() {
@@ -429,19 +511,21 @@ Result<void> Consumer::CommitSync() {
     }
 
     for (const Assignment& assignment : assignments) {
-        RequestEnvelope envelope;
-        envelope.api_key = ApiKey::kCommitOffset;
-        envelope.version = kProtocolVersion;
-        envelope.request_id = NextRequestId();
-        envelope.body.emplace<CommitOffsetRequest>(
-            CommitOffsetRequest{options_.group_id, topic,
-                                assignment.partition_id,
-                                assignment.next_offset});
-        auto committed = TypedResponse<CommitOffsetResponse>(connection_.RoundTrip(envelope),
-                                                             ApiKey::kCommitOffset,
-                                                             "commit offset");
-        if (!committed.ok()) {
-            return committed.status();
+        const int sources = IsInternalTopic(topic) ? 1 : 2;
+        for (int source = 0; source < sources; ++source) {
+            RequestEnvelope envelope;
+            envelope.api_key = ApiKey::kCommitOffset;
+            envelope.request_id = NextRequestId();
+            envelope.body = CommitOffsetRequest{options_.group_id,
+                source == 0 ? topic : std::string(kRetryTopicPrefix) + topic,
+                assignment.partition_id,
+                source == 0 ? assignment.next_offset : assignment.retry_next_offset};
+            auto response = connection_.RoundTrip(envelope);
+            if (source == 1 && response.ok() &&
+                response.value().error.error_code == ProtocolErrorCode::kTopicNotFound) continue;
+            auto committed = TypedResponse<CommitOffsetResponse>(std::move(response),
+                                                                 ApiKey::kCommitOffset, "commit offset");
+            if (!committed.ok()) return committed.status();
         }
     }
     return {};
@@ -525,6 +609,11 @@ Result<void> Consumer::JoinAndSync() {
         assignments.push_back(Assignment{
             partition_id,
             committed.value().committed ? committed.value().offset : 0});
+        if (!IsInternalTopic(topic)) {
+            auto retry = FetchCommittedOffset(std::string(kRetryTopicPrefix) + topic, partition_id);
+            if (!retry.ok()) return retry.status();
+            assignments.back().retry_next_offset = retry.value().committed ? retry.value().offset : 0;
+        }
     }
 
     std::lock_guard lock(mutex_);
@@ -545,7 +634,12 @@ Result<FetchCommittedOffsetResponse> Consumer::FetchCommittedOffset(
     envelope.request_id = NextRequestId();
     envelope.body.emplace<FetchCommittedOffsetRequest>(
         FetchCommittedOffsetRequest{options_.group_id, topic, partition_id});
-    return TypedResponse<FetchCommittedOffsetResponse>(connection_.RoundTrip(envelope),
+    auto response = connection_.RoundTrip(envelope);
+    if (IsRetryTopic(topic) && response.ok() &&
+        response.value().error.error_code == ProtocolErrorCode::kTopicNotFound) {
+        return FetchCommittedOffsetResponse{options_.group_id, topic, partition_id, false, 0};
+    }
+    return TypedResponse<FetchCommittedOffsetResponse>(std::move(response),
                                                        ApiKey::kFetchCommittedOffset,
                                                        "fetch committed offset");
 }

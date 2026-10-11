@@ -55,7 +55,10 @@ private:
     int listen_fd_{-1};
     std::uint16_t bound_port_{0};
     std::unique_ptr<Channel> accept_channel_;
+    std::once_flag stop_once_;
     std::mutex connections_mutex_;
+    bool stopping_{false};
+    bool loop_running_{false};
     std::unordered_map<int, std::shared_ptr<TcpConnection>> connections_;
 };
 

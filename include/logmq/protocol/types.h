@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -22,6 +23,7 @@ enum class ApiKey : std::uint16_t {
     kSyncGroup = 8,
     kHeartbeat = 9,
     kLeaveGroup = 10,
+    kNack = 11,
 };
 
 // 错误码
@@ -37,6 +39,20 @@ enum class ProtocolErrorCode : std::uint16_t {
 };
 
 inline constexpr std::uint16_t kProtocolVersion = 1;
+inline constexpr std::uint16_t kRetryProtocolVersion = 2;
+
+inline constexpr bool SupportedProtocolVersion(std::uint16_t version) {
+    return version == kProtocolVersion || version == kRetryProtocolVersion;
+}
+
+struct RetryMetadata {
+    std::uint32_t retry_count{0};
+    std::uint64_t next_visible_time{0};
+    TopicName original_topic;
+    std::string failure_reason;
+    PartitionId original_partition{kInvalidPartitionId};
+    Offset original_offset{kInvalidOffset};
+};
 
 // 客户端需要构造的帧头
 inline constexpr std::size_t kFrameHeaderBytes =
@@ -50,6 +66,7 @@ struct ProtocolRecord {
     std::uint64_t timestamp{0};
     std::string key;
     std::string value;
+    std::optional<RetryMetadata> retry{};
 };
 
 // 创建消息请求
@@ -123,6 +140,13 @@ struct LeaveGroupRequest {
     std::string member_id;
 };
 
+struct NackRequest {
+    TopicName topic;
+    PartitionId partition_id{kInvalidPartitionId};
+    Offset offset{kInvalidOffset};
+    std::string reason;
+};
+
 using RequestBody = std::variant<ProduceRequest,
                                  FetchRequest,
                                  MetadataRequest,
@@ -132,7 +156,8 @@ using RequestBody = std::variant<ProduceRequest,
                                  JoinGroupRequest,
                                  SyncGroupRequest,
                                  HeartbeatRequest,
-                                 LeaveGroupRequest>;
+                                 LeaveGroupRequest,
+                                 NackRequest>;
 
 // Complete decoded request frame. request_id is echoed by the response so a
 // client can match responses to in-flight requests on the same connection.
@@ -218,6 +243,14 @@ struct LeaveGroupResponse {
     std::int32_t generation_id{0};
 };
 
+struct NackResponse {
+    TopicName topic;
+    PartitionId partition_id{kInvalidPartitionId};
+    Offset offset{kInvalidOffset};
+    RetryMetadata retry;
+    bool dead_letter{false};
+};
+
 // Successful response payloads are typed by api_key, just like RequestBody.
 // Error responses keep the right empty alternative so callers can still inspect api_key.
 using ResponseBody = std::variant<ProduceResponse,
@@ -229,7 +262,8 @@ using ResponseBody = std::variant<ProduceResponse,
                                  JoinGroupResponse,
                                  SyncGroupResponse,
                                  HeartbeatResponse,
-                                 LeaveGroupResponse>;
+                                 LeaveGroupResponse,
+                                 NackResponse>;
 
 // Wire body layout is: error_code + message + optional success payload.
 // The success payload is present only when error_code == kNone.

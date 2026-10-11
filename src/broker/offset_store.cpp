@@ -1,4 +1,5 @@
 #include "logmq/broker/offset_store.h"
+#include "logmq/broker/retry_scheduler.h"
 
 #include <cctype>
 #include <fstream>
@@ -16,6 +17,9 @@ namespace {
 constexpr std::string_view kOffsetMetadataMagic = "logmq_consumer_offset_v1";
 
 Status ValidateSafeName(std::string_view name, std::string_view field) {
+    if (field == "topic" && IsInternalTopic(name)) {
+        name.remove_prefix(IsRetryTopic(name) ? kRetryTopicPrefix.size() : kDlqTopicPrefix.size());
+    }
     if (name.empty()) {
         return Status::InvalidArgument(std::string(field) + " must not be empty");
     }

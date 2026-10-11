@@ -8,6 +8,7 @@
 #include "logmq/base/config.h"
 #include "logmq/broker/group_coordinator.h"
 #include "logmq/broker/offset_store.h"
+#include "logmq/broker/retry_scheduler.h"
 #include "logmq/broker/topic_manager.h"
 #include "logmq/protocol/types.h"
 
@@ -16,6 +17,7 @@ namespace logmq {
 struct BrokerServiceOptions {
     StorageConfig storage;
     ConsumerConfig consumer;
+    RetryOptions retry;
 };
 
 class BrokerService {
@@ -30,6 +32,8 @@ public:
     [[nodiscard]] Status Close();
 
 private:
+    [[nodiscard]] ResponseEnvelope HandleNack(const RequestEnvelope& envelope,
+                                             const NackRequest& request);
     [[nodiscard]] ResponseEnvelope HandleProduce(const RequestEnvelope& envelope,
                                                  const ProduceRequest& request);
     [[nodiscard]] ResponseEnvelope HandleFetch(const RequestEnvelope& envelope,
@@ -61,6 +65,10 @@ private:
 
     BrokerServiceOptions options_;
     TopicManager topics_;
+    RetryScheduler retries_;
+    // Serialize append + scheduler publication so no retry offset is lost.
+    // ponytail: global Nack lock; use per-partition locks if failures dominate traffic.
+    std::mutex nack_mutex_;
     OffsetStore offsets_;
     GroupCoordinator groups_;
     // 异步模式在 `Produce` 之外批量处理持久化操作；同步模式则在 `HandleProduce` 内部执行刷盘操作，随后才返回成功

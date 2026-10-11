@@ -1,6 +1,7 @@
 #include "logmq/broker/broker_service.h"
 
 #include <string>
+#include <limits>
 #include <chrono>
 #include <utility>
 #include <variant>
@@ -54,6 +55,7 @@ ProtocolErrorCode GroupErrorCode(const Status& status) {
 BrokerService::BrokerService(BrokerServiceOptions options)
     : options_(std::move(options)),
       topics_(TopicManagerOptionsFromConfig(options_.storage)),
+      retries_(topics_),
       offsets_(OffsetStoreOptionsFromDataDir(options_.storage.data_dir)),
       groups_(GroupCoordinatorOptionsFromConfig(options_.consumer)) {}
 
@@ -70,6 +72,10 @@ Status BrokerService::Start() {
         return Status::InvalidArgument("broker service is closed");
     }
 
+    if (options_.retry.delay.count() < 0 || options_.retry.max_retries == 0 ||
+        options_.retry.max_retries == std::numeric_limits<std::uint32_t>::max()) {
+        return Status::InvalidArgument("invalid retry options");
+    }
     Status status = topics_.Load();
     if (!status.ok()) {
         return status;
@@ -78,6 +84,8 @@ Status BrokerService::Start() {
     if (!status.ok()) {
         return status;
     }
+    status = retries_.Start();
+    if (!status.ok()) return status;
     status = groups_.Start();
     if (!status.ok()) {
         return status;
@@ -93,12 +101,18 @@ Status BrokerService::Start() {
 }
 
 ResponseEnvelope BrokerService::Handle(const RequestEnvelope& request) {
-    if (request.version != kProtocolVersion) {
+    if (!SupportedProtocolVersion(request.version)) {
         return MakeError(request, ProtocolErrorCode::kUnsupportedVersion,
                          "unsupported protocol version");
     }
 
     switch (request.api_key) {
+        case ApiKey::kNack:
+            if (!std::holds_alternative<NackRequest>(request.body)) {
+                return MakeError(request, ProtocolErrorCode::kInvalidRequest,
+                                 "nack request envelope has wrong body type");
+            }
+            return HandleNack(request, std::get<NackRequest>(request.body));
         case ApiKey::kProduce:
             if (!std::holds_alternative<ProduceRequest>(request.body)) {
                 return MakeError(request, ProtocolErrorCode::kInvalidRequest,
@@ -176,6 +190,7 @@ Status BrokerService::Close() {
         flusher_condition_.notify_all();
         flusher_.join();
     }
+    retries_.Close();
     Status group_status = groups_.Close();
     Status topics_status = topics_.Close();
     if (!group_status.ok()) {
@@ -184,8 +199,80 @@ Status BrokerService::Close() {
     return topics_status;
 }
 
+
+ResponseEnvelope BrokerService::HandleNack(const RequestEnvelope& envelope,
+                                           const NackRequest& request) {
+    if (IsDlqTopic(request.topic)) {
+        return MakeError(envelope, ProtocolErrorCode::kInvalidRequest, "DLQ messages cannot be retried");
+    }
+    if (request.offset < 0) {
+        return MakeError(envelope, ProtocolErrorCode::kOffsetOutOfRange, "nack offset must not be negative");
+    }
+    std::lock_guard lock(nack_mutex_);
+    auto source = topics_.GetPartition(request.topic, request.partition_id);
+    if (!source.ok()) {
+        return MakeError(envelope, ProtocolErrorCode::kTopicNotFound, std::string(source.status().message()));
+    }
+    if (request.offset >= source.value()->log.next_offset()) {
+        return MakeError(envelope, ProtocolErrorCode::kOffsetOutOfRange, "nack offset is beyond log end");
+    }
+    if (IsRetryTopic(request.topic) &&
+        request.offset >= retries_.VisibleEnd(request.topic, request.partition_id)) {
+        return MakeError(envelope, ProtocolErrorCode::kInvalidRequest, "retry message is not visible yet");
+    }
+    auto batch = source.value()->log.Read(request.offset, kMaxRetryBatchBytes);
+    if (!batch.ok()) return MakeError(envelope, InvalidOrInternal(batch.status()), std::string(batch.status().message()));
+    const auto index = static_cast<std::size_t>(request.offset - batch.value().base_offset);
+    if (index >= batch.value().records.size()) {
+        return MakeError(envelope, ProtocolErrorCode::kInternal, "nack offset not found in batch");
+    }
+    const Record& stored = batch.value().records[index];
+    ProtocolRecord record = ToProtocolRecord(stored);
+    RetryMetadata retry{0, 0, request.topic, request.reason, request.partition_id, request.offset};
+    if (IsRetryTopic(request.topic)) {
+        auto decoded = DecodeRetryRecord(stored);
+        if (!decoded.ok()) return MakeError(envelope, ProtocolErrorCode::kInternal, std::string(decoded.status().message()));
+        record = std::move(decoded).value();
+        retry = *record.retry;
+        if (request.topic != std::string(kRetryTopicPrefix) + retry.original_topic ||
+            request.partition_id != retry.original_partition ||
+            retry.retry_count == std::numeric_limits<std::uint32_t>::max()) {
+            return MakeError(envelope, ProtocolErrorCode::kInternal, "invalid retry source metadata");
+        }
+    }
+    ++retry.retry_count;
+    retry.failure_reason = request.reason;
+    const bool dead_letter = retry.retry_count > options_.retry.max_retries;
+    retry.next_visible_time = dead_letter ? 0 : RetryNowMs() + static_cast<std::uint64_t>(options_.retry.delay.count());
+    record.retry = retry;
+    auto encoded = EncodeRetryRecord(record);
+    if (!encoded.ok()) return MakeError(envelope, InvalidOrInternal(encoded.status()), std::string(encoded.status().message()));
+    auto metadata = topics_.GetMetadata(retry.original_topic);
+    if (!metadata.ok()) return MakeError(envelope, ProtocolErrorCode::kTopicNotFound, std::string(metadata.status().message()));
+    const TopicName destination = std::string(dead_letter ? kDlqTopicPrefix : kRetryTopicPrefix) + retry.original_topic;
+    Status status = topics_.CreateTopic(destination, metadata.value().front().partition_count);
+    if (!status.ok()) return MakeError(envelope, InvalidOrInternal(status), std::string(status.message()));
+    auto target = topics_.GetPartition(destination, request.partition_id);
+    if (!target.ok()) return MakeError(envelope, ProtocolErrorCode::kInternal, std::string(target.status().message()));
+    auto appended = target.value()->log.Append({std::move(encoded).value()});
+    if (!appended.ok()) return MakeError(envelope, InvalidOrInternal(appended.status()), std::string(appended.status().message()));
+    // Publish every successful append even if a subsequent fsync fails, so a
+    // retried request cannot leave a permanent visibility hole in the log.
+    if (!dead_letter) retries_.Schedule(destination, request.partition_id,
+        appended.value().base_offset, retry.next_visible_time);
+    if (options_.storage.flush_policy == FlushPolicy::kSync) {
+        status = target.value()->log.Flush();
+        if (!status.ok()) return MakeError(envelope, ProtocolErrorCode::kInternal, std::string(status.message()));
+    }
+    return MakeSuccess(envelope, NackResponse{destination, request.partition_id,
+        appended.value().base_offset, std::move(retry), dead_letter});
+}
+
 ResponseEnvelope BrokerService::HandleProduce(const RequestEnvelope& envelope,
                                               const ProduceRequest& request) {
+    if (IsInternalTopic(request.topic)) {
+        return MakeError(envelope, ProtocolErrorCode::kInvalidRequest, "internal topics are reserved for Nack");
+    }
     if (request.records.empty()) {
         return MakeError(envelope, ProtocolErrorCode::kInvalidRequest,
                          "produce request must contain at least one record");
@@ -244,20 +331,24 @@ ResponseEnvelope BrokerService::HandleFetch(const RequestEnvelope& envelope,
                          std::string(partition.status().message()));
     }
 
-    const Offset high_watermark = partition.value()->log.next_offset();
-    if (request.offset == high_watermark) {
+    const Offset log_end = partition.value()->log.next_offset();
+    const Offset high_watermark = IsRetryTopic(request.topic)
+        ? retries_.VisibleEnd(request.topic, request.partition_id) : log_end;
+    if (request.offset > log_end) {
+        return MakeError(envelope, ProtocolErrorCode::kOffsetOutOfRange,
+                         "fetch offset is beyond log end");
+    }
+    if (request.offset >= high_watermark) {
         FetchResponse response;
         response.base_offset = request.offset;
         response.high_watermark = high_watermark;
         return MakeSuccess(envelope,
                            ResponseBody{std::in_place_type<FetchResponse>, std::move(response)});
     }
-    if (request.offset > high_watermark) {
-        return MakeError(envelope, ProtocolErrorCode::kOffsetOutOfRange,
-                         "fetch offset is beyond high watermark");
-    }
-
-    auto batch = partition.value()->log.Read(request.offset, request.max_bytes);
+    // Internal envelopes duplicate the key and add metadata. Charge the Fetch
+    // budget for the original payload, so a readable message remains retryable.
+    auto batch = partition.value()->log.Read(request.offset,
+        IsInternalTopic(request.topic) ? kMaxRetryBatchBytes : request.max_bytes);
     if (!batch.ok()) {
         ProtocolErrorCode code = batch.status().code() == ErrorCode::kNotFound
                                      ? ProtocolErrorCode::kOffsetOutOfRange
@@ -267,12 +358,25 @@ ResponseEnvelope BrokerService::HandleFetch(const RequestEnvelope& envelope,
 
     FetchResponse response;
     response.base_offset = batch.value().base_offset;
-    // In the single-broker version, all appended records are immediately visible.
-    // Replication can later replace this with the replicated high watermark.
+    // Retry partitions expose only the contiguous prefix released by the scheduler.
     response.high_watermark = high_watermark;
     response.records.reserve(batch.value().records.size());
     for (const Record& record : batch.value().records) {
-        response.records.push_back(ToProtocolRecord(record));
+        if (IsInternalTopic(request.topic)) {
+            auto decoded = DecodeRetryRecord(record);
+            if (!decoded.ok()) return MakeError(envelope, ProtocolErrorCode::kInternal,
+                                                std::string(decoded.status().message()));
+            auto value = std::move(decoded).value();
+            const auto payload_bytes = kRecordBatchHeaderBytes + EncodedRecordSize(ToStorageRecord(value));
+            if (payload_bytes > request.max_bytes) {
+                return MakeError(envelope, ProtocolErrorCode::kInvalidRequest,
+                                 "record batch is larger than max_bytes");
+            }
+            if (envelope.version == kProtocolVersion) value.retry.reset();
+            response.records.push_back(std::move(value));
+        } else {
+            response.records.push_back(ToProtocolRecord(record));
+        }
     }
     return MakeSuccess(envelope, ResponseBody{std::in_place_type<FetchResponse>, std::move(response)});
 }
@@ -293,6 +397,9 @@ ResponseEnvelope BrokerService::HandleMetadata(const RequestEnvelope& envelope,
 
 ResponseEnvelope BrokerService::HandleCreateTopic(const RequestEnvelope& envelope,
                                                   const CreateTopicRequest& request) {
+    if (IsInternalTopic(request.topic)) {
+        return MakeError(envelope, ProtocolErrorCode::kInvalidRequest, "internal topics are reserved for Nack");
+    }
     Status status = topics_.CreateTopic(request.topic, request.partition_count);
     if (!status.ok()) {
         return MakeError(envelope, InvalidOrInternal(status), std::string(status.message()));
@@ -427,7 +534,7 @@ ResponseEnvelope BrokerService::MakeError(const RequestEnvelope& envelope,
                                           std::string message) const {
     ResponseEnvelope response;
     response.api_key = envelope.api_key;
-    response.version = kProtocolVersion;
+    response.version = SupportedProtocolVersion(envelope.version) ? envelope.version : kProtocolVersion;
     response.request_id = envelope.request_id;
     response.error = ErrorResponse{code, std::move(message)};
     return response;
@@ -437,7 +544,7 @@ ResponseEnvelope BrokerService::MakeSuccess(const RequestEnvelope& envelope,
                                             ResponseBody body) const {
     ResponseEnvelope response;
     response.api_key = envelope.api_key;
-    response.version = kProtocolVersion;
+    response.version = SupportedProtocolVersion(envelope.version) ? envelope.version : kProtocolVersion;
     response.request_id = envelope.request_id;
     response.error = ErrorResponse{ProtocolErrorCode::kNone, ""};
     response.body = std::move(body);

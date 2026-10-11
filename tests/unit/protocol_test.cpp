@@ -164,7 +164,7 @@ TEST(ProtocolCodecTest, DecodeRejectsUnsupportedVersion) {
     ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
 
     encoded.value()[6] = std::byte{0x00};
-    encoded.value()[7] = std::byte{0x02};
+    encoded.value()[7] = std::byte{0x03};
 
     auto decoded = DecodeRequest(AsBytes(encoded.value()));
     ASSERT_FALSE(decoded.ok());
@@ -562,6 +562,71 @@ TEST(ProtocolCodecTest, DecodeRejectsSuccessfulResponseWithWrongBody) {
     auto encoded = EncodeResponse(response);
     ASSERT_FALSE(encoded.ok());
     EXPECT_EQ(encoded.status().code(), ErrorCode::kInvalidArgument);
+}
+
+TEST(ProtocolCodecTest, NackRoundTripPreservesLocationAndFailure) {
+    RequestEnvelope request;
+    request.api_key = ApiKey::kNack;
+    request.version = kRetryProtocolVersion;
+    request.request_id = 123;
+    request.body = NackRequest{"%RETRY%orders", 2, 17, "handler failed"};
+    auto encoded = EncodeRequest(request);
+    ASSERT_TRUE(encoded.ok()) << encoded.status().ToString();
+    auto decoded = DecodeRequest(AsBytes(encoded.value()));
+    ASSERT_TRUE(decoded.ok());
+    const auto& nack = std::get<NackRequest>(decoded.value().body);
+    EXPECT_EQ(nack.topic, "%RETRY%orders");
+    EXPECT_EQ(nack.partition_id, 2);
+    EXPECT_EQ(nack.offset, 17);
+    EXPECT_EQ(nack.reason, "handler failed");
+    ResponseEnvelope response;
+    response.api_key = ApiKey::kNack;
+    response.version = kRetryProtocolVersion;
+    response.request_id = 123;
+    response.body = NackResponse{"%DLQ%orders", 2, 4,
+        RetryMetadata{4, 0, "orders", "handler failed", 2, 9}, true};
+    auto wire = EncodeResponse(response);
+    ASSERT_TRUE(wire.ok());
+    auto result = DecodeResponse(AsBytes(wire.value()));
+    ASSERT_TRUE(result.ok());
+    const auto& reply = std::get<NackResponse>(result.value().body);
+    EXPECT_EQ(reply.topic, "%DLQ%orders");
+    EXPECT_TRUE(reply.dead_letter);
+    EXPECT_EQ(reply.retry.retry_count, 4);
+    EXPECT_EQ(reply.retry.original_offset, 9);
+    EXPECT_EQ(reply.retry.failure_reason, "handler failed");
+    wire.value().pop_back();
+    EXPECT_FALSE(DecodeResponse(AsBytes(wire.value())).ok());
+    request.body = NackRequest{"orders", 0, -1, "bad offset"};
+    EXPECT_FALSE(EncodeRequest(request).ok());
+}
+
+TEST(ProtocolCodecTest, FetchV2PreservesRetryMetadataAndV1OmitsIt) {
+    ProtocolRecord record{1000, "key", std::string("a\0b", 3)};
+    record.retry = RetryMetadata{2, 1700000005000ULL, "orders", "timeout", 1, 7};
+    ResponseEnvelope response;
+    response.api_key = ApiKey::kFetch;
+    response.version = kRetryProtocolVersion;
+    response.body = FetchResponse{3, 4, {record}};
+    auto encoded = EncodeResponse(response);
+    ASSERT_TRUE(encoded.ok());
+    auto decoded = DecodeResponse(AsBytes(encoded.value()));
+    ASSERT_TRUE(decoded.ok());
+    const auto& fetched = std::get<FetchResponse>(decoded.value().body).records.front();
+    EXPECT_EQ(fetched.value, std::string("a\0b", 3));
+    ASSERT_TRUE(fetched.retry.has_value());
+    EXPECT_EQ(fetched.retry->retry_count, 2);
+    EXPECT_EQ(fetched.retry->next_visible_time, 1700000005000ULL);
+    EXPECT_EQ(fetched.retry->original_topic, "orders");
+    EXPECT_EQ(fetched.retry->original_partition, 1);
+    EXPECT_EQ(fetched.retry->original_offset, 7);
+    response.version = kProtocolVersion;
+    auto legacy = EncodeResponse(response);
+    ASSERT_TRUE(legacy.ok());
+    auto legacy_decoded = DecodeResponse(AsBytes(legacy.value()));
+    ASSERT_TRUE(legacy_decoded.ok());
+    EXPECT_FALSE(std::get<FetchResponse>(legacy_decoded.value().body).records.front().retry);
+    EXPECT_LT(legacy.value().size(), encoded.value().size());
 }
 
 }  // namespace

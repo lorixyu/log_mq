@@ -1,4 +1,5 @@
 #include "logmq/broker/topic_manager.h"
+#include "logmq/broker/retry_scheduler.h"
 
 #include <algorithm>
 #include <cctype>
@@ -20,6 +21,9 @@ constexpr std::uint64_t kFnvOffsetBasis = 14695981039346656037ULL;
 constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
 
 Status ValidateTopicName(std::string_view topic) {
+    if (IsInternalTopic(topic)) {
+        topic.remove_prefix(IsRetryTopic(topic) ? kRetryTopicPrefix.size() : kDlqTopicPrefix.size());
+    }
     if (topic.empty()) {
         return Status::InvalidArgument("topic name must not be empty");
     }
@@ -288,6 +292,7 @@ Result<std::unique_ptr<Topic>> TopicManager::OpenTopic(const TopicName& topic,
         log_options.data_dir = PartitionPath(topic, static_cast<PartitionId>(id));
         log_options.segment_bytes = options_.segment_bytes;
         log_options.index_interval_bytes = options_.index_interval_bytes;
+        log_options.strict_recovery = IsInternalTopic(topic);
 
         // data_dir/orders/0/      get a safety commitlog;
         auto log = CommitLog::Open(std::move(log_options));

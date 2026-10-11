@@ -34,7 +34,8 @@ ConsumerRecord 在保留现有字段的同时增加可选 RetryMetadata；topic/
 
 保持版本 1 的现有消息布局。增加显式版本 2，供携带重试元数据的 Fetch 和 Nack 使用；
 两端编解码器支持版本 1、2，版本 2 的 Fetch Record 增加可选元数据字段。
-SDK 的重试 Fetch 和 Nack 使用版本 2。版本 1 Fetch 内部 Topic 仍返回原始 key/value，
+SDK 普通 Fetch 使用版本 1，内部 Topic Fetch 和 Nack 使用版本 2。
+版本 1 Fetch 内部 Topic 仍返回原始 key/value，
 但没有重试元数据；Nack 计数仍由 Broker 依据持久化记录计算。
 非法版本、截断字段、非法 offset、错误 body 类型均返回已有错误模型。
 
@@ -73,6 +74,8 @@ base_offset 保持请求位置，Consumer 不推进游标。过了真实 log end
 启动时扫描内部 Retry 日志、校验 envelope，以持久化截止时间重建可见前缀与待调度任务；
 到期的历史记录继续可读，不重新追加到原 Topic。恢复读取使用协议支持的最大消息上限，
 而非固定 4096 字节。损坏数据或 IO 失败必须使启动失败，不能静默跳过。
+内部 Topic 的 CommitLog 使用严格恢复：仅允许截断活动分段末尾未写完的 header/payload；
+完整 batch 校验失败或封存分段残缺会报错并保留文件，避免在 envelope 校验前删除消息。
 系统时钟回拨可能延迟可见时间；同分区前序消息未到期会阻塞后序消息，保留有序消费。
 
 追加与登记调度任务必须串行发布，防止并发 Nack 产生未登记空洞。
@@ -89,7 +92,8 @@ Rebalance 后分别恢复两类已提交位置，CommitSync 分别提交两类�
 
 Nack 成功表示失败消息已转存；Nack 不自动 CommitSync，应用仍须遵守先处理或成功 Nack、
 再提交消费进度的现有契约。由于 Poll 以批次推进位置，批次中有尚未处理或 Nack 失败的消息时
-不能提交整个批次；应用可以重试 Nack 或 Seek 回失败位置。
+不能提交整个批次；应用可以重试 Nack 后处理完批次，或停止消费并恢复已提交位点。
+使用 Seek 时必须回退全部尚未处理的 Topic/分区，不能只回退一个失败记录后提交其他分区。
 
 本阶段遵循路线图的 Topic 级重试语义：不同 Consumer Group 各自读 Retry Topic，
 因此某组产生的重试消息对其他组也可见。按失败组隔离的定向重试不属于本次范围。
@@ -102,9 +106,15 @@ Nack 的请求超时或应用重复调用可能写出重复重试记录，保持
 - 新增 `broker/retry_scheduler.h/.cpp`：内部 envelope 编解码、任务恢复与延迟可见前缀。
 - `broker/broker_service.h/.cpp`：Nack 路由、内部 Topic 写入、Fetch 可见边界及线程生命周期。
 - `broker/topic_manager.cpp`：合法内部名称校验。
+- `storage/commit_log.h/.cpp`：内部 Topic 严格恢复，区分损坏完整记录与活动分段残缺尾部。
+- `broker/offset_store.cpp`、`broker/group_coordinator.cpp`：提交、恢复及订阅时支持合法内部 Topic 名称。
 - `client/client.h/.cpp`：Nack API、双游标 Poll、Commit、Rebalance 恢复。
 - `CMakeLists.txt`：纳入新实现文件；现有 unit/integration 测试目标承载新增用例。
 - 路线图及开发笔记：记录实际完成状态、使用示例、消费提交契约和上述边界。
+
+实施细化：内部 envelope 复用版本 2 Fetch 编解码，在其前追加魔数和 envelope 版本；
+内部 Fetch 的 max_bytes 按原始消息的 RecordBatch 大小计算，内部封装及元数据开销不计入此预算，
+响应仍受 kMaxFrameBytes 上限约束。切换订阅 Topic 时先停止旧心跳并 LeaveGroup，再重新加入。
 
 ## 验证与完成标准
 

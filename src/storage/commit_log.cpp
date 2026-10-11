@@ -1,6 +1,7 @@
 #include "logmq/storage/commit_log.h"
 
 #include <algorithm>
+#include <array>
 #include <iomanip>
 #include <limits>
 #include <sstream>
@@ -285,7 +286,7 @@ Status CommitLog::LoadOrCreateSegments() {
         }
 
         OffsetIndex index(IndexPath(base_offset), base_offset, options_.index_interval_bytes);
-        auto recovery = RecoverSegment(segment.value(), index);
+        auto recovery = RecoverSegment(segment.value(), index, path == logs.back().second);
         if (!recovery.ok()) {
             return recovery.status();
         }
@@ -302,7 +303,8 @@ Status CommitLog::LoadOrCreateSegments() {
 }
 
 // 崩溃重启后，扫描 segment 日志文件，恢复有效日志边界，重新计算下一个 offset，并重建 OffsetIndex
-Result<CommitLog::RecoveryResult> CommitLog::RecoverSegment(Segment& segment, OffsetIndex& index) {
+Result<CommitLog::RecoveryResult> CommitLog::RecoverSegment(Segment& segment, OffsetIndex& index,
+                                                          bool active_segment) {
     index.Clear();
 
     std::uint64_t position = 0;
@@ -317,6 +319,25 @@ Result<CommitLog::RecoveryResult> CommitLog::RecoverSegment(Segment& segment, Of
 
         auto batch = segment.Read(position, static_cast<std::size_t>(remaining));
         if (!batch.ok()) {
+            if (options_.strict_recovery) {
+                if (!active_segment || batch.status().code() == ErrorCode::kIoError) {
+                    return batch.status();
+                }
+                if (remaining < kRecordBatchHeaderBytes) break;
+
+                // A valid header with a missing payload is a torn append. A
+                // complete batch that fails CRC/decoding must remain untouched.
+                auto file = File::Open(segment.path(), O_RDONLY);
+                if (!file.ok()) return file.status();
+                std::array<std::byte, kRecordBatchHeaderBytes> header{};
+                auto read = file.value().PRead(header, position);
+                if (!read.ok()) return read.status();
+                if (read.value() != header.size()) return batch.status();
+                auto declared_bytes = PeekRecordBatchBytes(header);
+                if (!declared_bytes.ok() || declared_bytes.value() <= remaining) {
+                    return batch.status();
+                }
+            }
             break;
         }
 
