@@ -12,7 +12,6 @@ data/
 
 docs/
 
-.vscode
 # 忽略 Vim / Neovim 生成的交换文件
 *.swp
 *.swo
@@ -28,3 +27,5 @@ docs/
 build/
 .vscode/
 .idea/
+.cache/
+.superpowers/
