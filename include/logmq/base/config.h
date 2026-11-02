@@ -37,7 +37,7 @@ inline int DefaultWorkerThreads() {
     return n == 0 ? 4 : static_cast<int>(n);
 }
 
-// 网络程和连接数限制配置。
+// 网络和连接数限制配置。
 struct NetworkConfig {
     int io_threads{4};
     int worker_threads{DefaultWorkerThreads()};

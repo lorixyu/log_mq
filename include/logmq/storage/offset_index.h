@@ -10,7 +10,7 @@
 
 namespace logmq {
 
-// 某个 batch 在 segment 文件中的物理位置
+// 一条索引，记录一条batch的offset对物理位置的偏移
 struct IndexEntry {
     Offset offset{kInvalidOffset};  // 某个 RecordBatch 的 base_offset
     std::uint64_t position{0};

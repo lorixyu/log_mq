@@ -30,7 +30,7 @@ struct DecodedRecord {
     std::size_t bytes_consumed{0};
 };
 
-// Size of the fixed header in bytes.
+// 固定头部的字节数
 // Header : [timestamp | key_size | value_size | crc]
 inline constexpr std::size_t kRecordHeaderBytes =
     sizeof(std::uint64_t) + sizeof(std::uint32_t) + sizeof(std::uint32_t) + sizeof(std::uint32_t);

@@ -11,7 +11,7 @@
 namespace logmq {
 namespace {
 
-// Parse offset from file name.
+// 从文件名解析 offset
 bool ParseBaseOffset(const std::filesystem::path& path, Offset& offset) {
     const std::string name = path.stem().string();
     if (name.empty()) {
@@ -71,7 +71,7 @@ CommitLog& CommitLog::operator=(CommitLog&& other) noexcept {
     return *this;
 }
 
-// 重启/恢复 一个 Partition 里的 Segemnts;
+// 重启/恢复 一个 Partition 里的 Segments;
 Result<CommitLog> CommitLog::Open(CommitLogOptions options) {
     if (options.data_dir.empty()) {
         return Status::InvalidArgument("commit log data_dir must not be empty");
